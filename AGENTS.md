@@ -8,6 +8,8 @@ Subscription Bridge is a privacy-preserving payment-processor abstraction servic
 
 The bridge owns processor credentials, processor-native identifiers, recurring payment state, provider webhooks, callback delivery, and the Adyen recurring scheduler. The consumer application owns user identity, account authorization, feature gates, and its local plan catalog.
 
+V1 requires complete Stripe and Adyen adapters. Each bridge deployment serves exactly one consumer application, one consumer webhook URL, one pairing-root set, and one consumer protocol namespace. Multi-consumer and public multi-merchant operation are out of scope.
+
 It is vital to preserve the privacy boundary and the transactional and idempotency guarantees described in `SPEC.md`.
 
 ## Required Reading
@@ -35,14 +37,12 @@ Do not describe compatibility behavior as necessary unless an actual deployed de
 
 The bridge must never receive or store consumer usernames, consumer account IDs, or other consumer identity fields.
 
-The only consumer join identifiers are:
+The only cross-system join identifiers are:
 
 - `checkout_id`
 - `subscription_ref`
-- `plan_id`
-- `event_id`
 
-These identifiers must be opaque and must not encode usernames, email addresses, sequential account IDs, tenant names, or other identifying information.
+Both identifiers must be opaque and must not encode usernames, email addresses, sequential account IDs, tenant names, or other identifying information. `plan_id` is a shared catalog key. `event_id` is an idempotency and audit identifier. Neither should be described as an identity join key.
 
 Processor metadata must contain only the minimum opaque identifiers required by the protocol. Never place a username, consumer account ID, or application-specific user profile in processor metadata.
 
@@ -57,6 +57,7 @@ Do not:
 - Log provider credentials or webhook secrets.
 - Log pairing roots or derived HMAC keys.
 - Log stored-payment-method references.
+- Log processor shopper references.
 - Log full provider customer or subscription objects.
 - Return provider-native identifiers to consumer applications.
 - Include raw provider payloads in ordinary logs or HTTP errors.
@@ -70,7 +71,7 @@ Subscription Bridge Protocol v1 uses one consumer pairing root and three HKDF-SH
 
 The labels and salt in `SPEC.md` are protocol constants. Do not alter them locally or introduce alternative derivation paths.
 
-The pairing root must never be used directly as an HMAC key.
+The configured pairing root is exactly 64 lowercase hexadecimal characters representing 32 bytes. Reject uppercase, whitespace, non-hex characters, prefixes, and every other length; hex-decode before HKDF. The pairing root must never be used directly as an HMAC key.
 
 Every callback must include a stable `event_id` and a strictly monotonic `state_version`.
 
@@ -80,9 +81,10 @@ For each `subscription_ref`:
 - Every consumer-visible state change increments the version exactly once.
 - A state version identifies one immutable outbound payload.
 - `(subscription_ref, state_version)` must be unique.
-- Retried delivery must reuse the exact stored event ID and JSON payload.
+- Retried delivery must reuse the exact stored event ID and callback body bytes.
 - Delivery retries must not generate a new state version.
 - Duplicate or late processor events must not regress subscription state.
+- `state_changed_at` is the UTC transaction time at which the canonical state for that version committed; it is never request, retrieval, or delivery time.
 
 Unknown fields, malformed identifiers, unsupported versions, invalid timestamps, and invalid event/status combinations must fail closed.
 
@@ -110,14 +112,18 @@ The outbound event table is an immutable transactional outbox.
 
 The notifier must:
 
-- Claim due rows with a bounded lease.
-- Send the stored JSON bytes without reconstructing the payload.
+- Claim due rows with a bounded lease and conditional ownership.
+- Send the authoritative stored callback bytes without reconstructing the payload from JSONB.
 - Sign each attempt with the derived callback key.
 - Treat any 2xx response as delivered.
 - Retry only the response classes defined in `SPEC.md`.
 - Dead-letter deterministic protocol/configuration 4xx responses.
 - Record bounded, non-sensitive error classifications.
 - Permit safe replay through the operator CLI.
+
+The authoritative callback body is `BYTEA`, not JSONB. Delivery state is explicitly `pending`, `delivered`, `dead_lettered`, or `abandoned`; terminal rows are not due. Requeue and abandonment are audited and preserve the event ID, state version, and exact body.
+
+Notifier claims use random claim tokens and monotonically increasing fencing tokens. Claim, reclaim, delivery completion, retry scheduling, and terminal transitions must conditionally verify ownership so an expired notifier cannot commit a stale result.
 
 Do not hold a database transaction open during network delivery.
 
@@ -149,6 +155,8 @@ Do not infer successful payment from `checkout.session.completed` alone. Retriev
 
 Late Stripe events must not regress state. Insert the provider event idempotently, retrieve current provider state, lock the local subscription, and calculate the transition from authoritative state.
 
+Do not hold a transaction or row lock while retrieving Stripe. Stripe processing leases use random claim tokens and monotonically increasing fencing tokens. Every claim or expired-lease reclaim increments the fence. A worker may commit only when the processing action ID, `running` state, claim token, and fencing token still match; otherwise it discards its observation.
+
 Unknown Stripe price IDs must be quarantined for operator action. Never silently map an unknown price to a local plan.
 
 Use stable Stripe idempotency keys for checkout creation and operator-initiated mutations.
@@ -169,11 +177,15 @@ Recurring charges must use:
 
 The scheduler must tolerate process termination at every step without causing a duplicate charge.
 
-A transport timeout produces an uncertain pending attempt. Do not issue another charge until the original result has been resolved through provider lookup or webhook delivery.
+A transport timeout produces an `uncertain` attempt. Persist the exact canonical request before calling, encrypt it with authenticated envelope encryption and key-version metadata, and replay only those exact plaintext bytes with the same idempotency key within the verified Adyen retention window. Do not claim lookup by idempotency key or merchant reference without a verified supported API. Do not issue another attempt until a definitive refusal. Unresolved attempts become `manual_review`, block all later automatic charging, and leave consumer-visible state `past_due` until audited resolution.
+
+Persist the provider endpoint/API version, merchant account, amount and currency, stable attempt and shopper references, interaction models, idempotency key, canonical request fingerprint, and encrypted exact body. Compute the fingerprint over the normative canonical plaintext before encryption. Stored-payment-method references must never exist in plaintext at rest or logs.
 
 Calendar periods are computed in UTC from the original activation anniversary. Monthly periods clamp to the final day of shorter months.
 
 Refusal classifications and dunning delays must come from centralized configuration or provider policy code, not scattered literals.
+
+Renewals and canceled-subscription expiry use generalized durable scheduled actions. Each action has a stable key derived from subscription, action type, and target period/transition. Every claim increments a monotonically increasing fence. Completion requires a conditional match on action ID, `running` state, claim token, and fence, so an expired worker cannot commit after a newer claimant.
 
 ## Database Requirements
 
@@ -191,6 +203,9 @@ Database constraints are part of the security and correctness model. Preserve an
 - Valid status constraints
 - Scheduler due-row indexes
 - Outbound-delivery indexes
+- Scheduled-action key uniqueness, due indexes, claim tokens, and fencing tokens
+- Provider processing leases and fencing tokens
+- Explicit outbox terminal-state constraints
 
 Migrations must be reviewed for lock duration, failure recovery, downgrade implications, and handling of sensitive columns.
 
@@ -222,6 +237,8 @@ Protocol constants, HKDF labels, replay windows, callback limits, retry schedule
 
 Do not duplicate security-sensitive constants across packages.
 
+`fixtures/protocol-v1.json` is the canonical machine-readable protocol fixture. Any consumer copy must be byte-identical and identify the source bridge commit or release.
+
 Plan amount and currency are immutable for an existing `plan_id`. Changing either requires a new plan ID.
 
 Provider selection must come from trusted configuration. Do not accept provider selection from user-controlled query parameters.
@@ -234,6 +251,8 @@ Apply bounded request bodies, bounded response bodies, server timeouts, client t
 
 Reject unknown JSON fields on protocol endpoints.
 
+Start and portal tokens require integer `iat` and `exp`, `exp > iat`, a maximum 15-minute lifetime, bounded future issue time, and the specification's clock-skew validation. The first accepted checkout ID is immutably bound to its plan, normalized return URL, processor, and request fingerprint. Conflicting reuse fails; exact replay resumes with the same provider idempotency key.
+
 Public and consumer callback URLs must use HTTPS except for explicit loopback development URLs.
 
 Do not follow unexpected redirects in authenticated server-to-server requests.
@@ -241,6 +260,8 @@ Do not follow unexpected redirects in authenticated server-to-server requests.
 Do not expose existence or provider state through materially different unauthenticated response behavior.
 
 Authentication and signature checks must occur before parsing or acting on untrusted provider events, except for the minimum bounded parsing required by a provider’s signature scheme.
+
+Do not retain raw provider webhook payloads by default. After verification, persist only event identity, type, payload hash, processing state, timestamps, and minimum normalized recovery/audit fields. Any diagnostic quarantine is opt-in, separately access-controlled, authenticated-encrypted, automatically deleted within the specification's short maximum retention, and excluded from normal logs, metrics, errors, and CLI output.
 
 HTTP errors returned to callers must be concise and must not include raw provider bodies, SQL errors, secrets, or internal identifiers.
 
@@ -279,6 +300,12 @@ Maintain:
 - Stripe fixture tests
 - Adyen fixture tests
 - Scheduler crash-point tests
+- Stripe and scheduled-action stale-worker fencing tests
+- Adyen uncertain-attempt, exact replay, and manual-review tests
+- Checkout conflict and provider-timeout idempotency tests
+- Callback byte-identity and delivery terminal-state tests
+- Token lifetime and pairing-root representation tests
+- Canceled-subscription expiry tests
 - PostgreSQL integration tests
 - Common adapter conformance tests
 - Cross-repository consumer tests
