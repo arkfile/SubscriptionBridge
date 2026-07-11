@@ -109,6 +109,8 @@ Consumer signs when user initiates checkout. Bridge receives `GET /v1/start?toke
 2. `sig = HMAC-SHA256(token_key, body)` → lowercase hex.
 3. `token = base64url(body) + "." + hex(sig)` (RawURLEncoding, no padding).
 
+The token wire representation is canonical: exactly one `.` separator; an unpadded Raw URL-safe Base64 payload whose decode/re-encode is byte-identical; and exactly 64 lowercase hexadecimal signature characters. Reject Base64 padding, non-canonical Base64 spellings, uppercase hex, whitespace, extra separators, missing/duplicate/unknown JSON fields, duplicate JSON object keys, trailing JSON values, and tokens longer than 8192 bytes.
+
 **Validation**
 
 - Verify HMAC with the HKDF-derived token key using constant-time comparison before acting on the payload.
@@ -136,7 +138,7 @@ Derive three 32-byte keys using HKDF-SHA256:
 - callback key info: ASCII `bridge-to-consumer/callback`
 - reconcile key info: ASCII `consumer-to-bridge/reconcile`
 
-Keys are binary HKDF output, not hex text. Implementations must never use the decoded pairing root directly as an HMAC key. Rotation uses a short two-root verification window, with all new signatures generated from the new root; every configured root independently obeys the exact encoding above.
+Keys are binary HKDF output, not hex text. Implementations must never use the decoded pairing root directly as an HMAC key. Protocol v1 configures exactly one active pairing root and defines no overlapping two-root verification window. Rotation is a coordinated operational cutover that temporarily interrupts cross-service authentication until both sides use the new root; a future protocol version may define an explicit overlap mechanism.
 
 Canonical derivation vector:
 
@@ -153,7 +155,7 @@ callback key     069dddf506c40199b88267dbc754808242339730f5cb042f3d72e4e19dbe946
 reconcile key    c090ac1d8b5c248d45c8ce7ca9f9b463b1f6ad4a2086061d53111214e24a433c
 ```
 
-`fixtures/protocol-v1.json` is the canonical machine-readable fixture for this derivation and the signed protocol examples. The consumer repository mirrors that file and records the source bridge commit or release.
+`fixtures/protocol-v1.json` is the canonical machine-readable fixture for this derivation and the signed protocol examples. The consumer repository mirrors that file byte-for-byte and records the source bridge commit or release. The current fixture was introduced by SubscriptionBridge commit [`28c2c9965d32a44fe2ea572c89fbc4f15662f371`](https://github.com/arkfile/SubscriptionBridge/commit/28c2c9965d32a44fe2ea572c89fbc4f15662f371).
 
 ### 5.2 Portal token (consumer → bridge, via browser)
 
@@ -181,6 +183,8 @@ Default path in reference consumer: `/api/webhooks/subscription-bridge`
 
 **Signature base string:** `<unix> + "." + raw_json_body`  
 **HMAC key:** HKDF-derived callback key.
+
+The header value is exactly `t=<unix>,v1=<hex>` in that order, without whitespace or additional components. `<unix>` is canonical non-negative base-10 notation with no leading zero except the value `0`; `<hex>` is exactly 64 lowercase hexadecimal characters. Reject reordered, duplicated, missing, unknown, uppercase, whitespace-padded, signed, or otherwise non-canonical components. The timestamp must be within ±300 seconds of the receiver's current UTC time.
 
 **Body:**
 
@@ -214,7 +218,7 @@ Default path in reference consumer: `/api/webhooks/subscription-bridge`
 
 **`status` values:** `active`, `trialing`, `past_due`, `canceled`, `expired`.
 
-`canceled` means non-renewing but still effective through `current_period_end`; it always has `cancel_at_period_end=true`. `expired` means no longer effective and always has `cancel_at_period_end=false`. Immediate cancellation transitions directly to `expired` and emits `subscription.expired`. Consumer entitlement during `past_due` is governed by the consumer's independently documented local grace policy; bridge dunning determines only whether billing recovery continues and when the canonical state transitions to `expired`.
+`canceled` means non-renewing but still effective through `current_period_end`; it always has `cancel_at_period_end=true`. `expired` means no longer effective and always has `cancel_at_period_end=false`. **Only `expired` is terminal.** A provider-authoritative restoration may transition `canceled` back to `active` through `subscription.renewed`. Immediate cancellation transitions directly to `expired` and emits `subscription.expired`. Consumer entitlement during `past_due` is governed by the consumer's independently documented local grace policy; bridge dunning determines only whether billing recovery continues and when the canonical state transitions to `expired`.
 
 Allowed bridge callback pairs are exact: `subscription.activated` with `active` or `trialing`; `subscription.renewed` with `active`; `subscription.past_due` with `past_due`; `subscription.canceled` with `canceled`; `subscription.expired` with `expired`; and `subscription.plan_changed` with `active`. `subscription.sync` is not a callback pair. Every other event/status combination fails closed.
 
@@ -228,7 +232,7 @@ Allowed bridge callback pairs are exact: `subscription.activated` with `active` 
 
 The notifier sends the exact immutable bytes stored in `payload_body`; JSONB serialization is never authoritative. Any 2xx marks delivery complete. Network failures, 408, 425, 429, and 5xx retry with full jitter over 1 minute, 5 minutes, 15 minutes, 1 hour, then a 6-hour cap. Other 4xx responses transition to `dead_lettered` because they indicate a protocol/configuration defect. Attempts continue while state is `pending` until delivery or audited operator abandonment. Alert after 1 hour and again after 24 hours. Concurrent notifiers claim rows using leases and `FOR UPDATE SKIP LOCKED`.
 
-`event_id`, `checkout_id`, and `subscription_ref` are opaque values with the `evt_`, `subchk_`, and `sub_` prefixes respectively. Every shown callback field is required; no other field is permitted. `processor_family` is intentionally absent because consumer behavior must be provider-neutral. Timestamps use second-precision UTC RFC3339 with `Z`; period end must be after period start. `state_changed_at` is the time at which the canonical state represented by `state_version` was committed, never callback-send or retrieval time. The receiver must reject unknown fields, unknown event/status values, malformed identifiers, unordered periods, and incompatible event/status pairs.
+`event_id`, `checkout_id`, and `subscription_ref` are opaque values with the `evt_`, `subchk_`, and `sub_` prefixes respectively. In every token, callback, snapshot, URL path, and operator input, each is at most 160 ASCII characters in total and has a non-empty suffix containing only ASCII letters, digits, `_`, or `-`; equivalently, validate the exact prefix followed by `[A-Za-z0-9_-]+` and the total length bound. Every shown callback field is required; no other field is permitted. `processor_family` is intentionally absent because consumer behavior must be provider-neutral. Timestamps use second-precision UTC RFC3339 with `Z`; period end must be after start. `state_changed_at` is the time at which the canonical state represented by `state_version` was committed, never callback-send or retrieval time. The receiver must reject unknown or duplicate fields, unknown event/status values, malformed identifiers, unordered periods, and incompatible event/status pairs.
 
 ### 5.4 Subscription snapshot (consumer → bridge, server-to-server)
 
@@ -237,6 +241,8 @@ The notifier sends the exact immutable bytes stored in `payload_body`; JSONB ser
 **Auth header:** `Authorization: Subscription-Bridge-HMAC t=<unix>,v1=<hex>`
 
 **String to sign:** `GET\n/v1/subscriptions/{subscription_ref}\n<unix>`
+
+The authorization value is exactly the ASCII scheme `Subscription-Bridge-HMAC`, one space, then the same canonical `t=<unix>,v1=<hex>` component grammar and ±300-second replay window as callback signatures. The method is exactly uppercase `GET`; the signed path is the exact request path with no query string. Reject alternate schemes, whitespace, reordered or extra components, non-canonical timestamps, uppercase signatures, and path/signature mismatches.
 
 **Response 200:** the exact snapshot schema below. Every field is required and unknown fields are rejected:
 
@@ -947,7 +953,10 @@ Paid subscription cancel: processor dashboard or portal — not consumer admin C
 - HKDF golden vectors above; start/portal token, callback, and reconcile signatures must interoperate with the consumer `subbridge` package.
 - Replay-window boundaries, malformed headers, invalid identifiers, unknown JSON fields, body limits, and URL validation.
 - Pairing-root acceptance for exactly 64 lowercase hex characters and rejection of wrong lengths, uppercase, whitespace, prefixes, and non-hex input.
+- Proof that v1 loads and verifies with exactly one active pairing root and provides no previous-root fallback.
 - Start and portal token `iat`/`exp` boundaries, bounded future issue time, excessive lifetime, exact replay, checkout-property conflicts, and provider timeouts before and after request acceptance.
+- Canonical token/Base64/signature parsing and canonical callback/reconciliation HMAC headers, including rejection of padding, leading-zero timestamps, reordered or duplicate components, whitespace, uppercase hex, and unknown components.
+- Opaque identifier acceptance at the 160-character total boundary and rejection of empty suffixes, overlong values, non-ASCII, punctuation outside `_`/`-`, and incorrect prefixes in every protocol location.
 - State transition matrix for every event/status pair and monotonic `state_version`.
 - Stripe and Adyen fixtures for every mapping in sections 10–11, including duplicate and out-of-order provider events.
 - Calendar-period tests for month ends and leap years.
@@ -980,6 +989,7 @@ Run the same black-box suite against Stripe and Adyen. Each adapter must create 
 - Logs and HTTP responses contain no pairing root, derived key, payment-method reference, provider customer ID, or raw provider payload.
 - Both provider conformance suites pass from a clean database.
 - `fixtures/protocol-v1.json` passes in this repository and its byte-identical mirrored copy passes in the consumer repository.
+- The conformance suite consumes `fixtures/protocol-v1.json` directly and verifies every derived key, signed token, exact callback body/header, reconciliation header, and snapshot body without independently re-entered expected values.
 
 **Cross-repo e2e**
 

@@ -44,6 +44,8 @@ The only cross-system join identifiers are:
 
 Both identifiers must be opaque and must not encode usernames, email addresses, sequential account IDs, tenant names, or other identifying information. `plan_id` is a shared catalog key. `event_id` is an idempotency and audit identifier. Neither should be described as an identity join key.
 
+Every protocol occurrence of `checkout_id`, `subscription_ref`, or `event_id` must use its exact `subchk_`, `sub_`, or `evt_` prefix, a non-empty suffix containing only ASCII letters, digits, `_`, or `-`, and a maximum total length of 160 characters.
+
 Processor metadata must contain only the minimum opaque identifiers required by the protocol. Never place a username, consumer account ID, or application-specific user profile in processor metadata.
 
 Do not claim that the architecture makes correlation impossible. An operator with access to both databases can correlate opaque identifiers. The design goal is data minimization and separation of operational access.
@@ -71,7 +73,7 @@ Subscription Bridge Protocol v1 uses one consumer pairing root and three HKDF-SH
 
 The labels and salt in `SPEC.md` are protocol constants. Do not alter them locally or introduce alternative derivation paths.
 
-The configured pairing root is exactly 64 lowercase hexadecimal characters representing 32 bytes. Reject uppercase, whitespace, non-hex characters, prefixes, and every other length; hex-decode before HKDF. The pairing root must never be used directly as an HMAC key.
+The configured pairing root is exactly 64 lowercase hexadecimal characters representing 32 bytes. Reject uppercase, whitespace, non-hex characters, prefixes, and every other length; hex-decode before HKDF. The pairing root must never be used directly as an HMAC key. V1 has exactly one active root and no two-root verification overlap or previous-root fallback.
 
 Every callback must include a stable `event_id` and a strictly monotonic `state_version`.
 
@@ -85,6 +87,7 @@ For each `subscription_ref`:
 - Delivery retries must not generate a new state version.
 - Duplicate or late processor events must not regress subscription state.
 - `state_changed_at` is the UTC transaction time at which the canonical state for that version committed; it is never request, retrieval, or delivery time.
+- Only `expired` is terminal. `canceled` remains effective through its period end and may transition back to `active` only through a provider-authoritative `subscription.renewed` transition.
 
 Unknown fields, malformed identifiers, unsupported versions, invalid timestamps, and invalid event/status combinations must fail closed.
 
@@ -239,6 +242,8 @@ Do not duplicate security-sensitive constants across packages.
 
 `fixtures/protocol-v1.json` is the canonical machine-readable protocol fixture. Any consumer copy must be byte-identical and identify the source bridge commit or release.
 
+The current fixture source is commit `28c2c9965d32a44fe2ea572c89fbc4f15662f371`. Protocol conformance tests must consume the fixture directly rather than duplicate expected keys, signatures, headers, or JSON bytes.
+
 Plan amount and currency are immutable for an existing `plan_id`. Changing either requires a new plan ID.
 
 Provider selection must come from trusted configuration. Do not accept provider selection from user-controlled query parameters.
@@ -250,6 +255,8 @@ Secrets must be read from environment variables, secret files, or an approved se
 Apply bounded request bodies, bounded response bodies, server timeouts, client timeouts, and strict JSON decoding.
 
 Reject unknown JSON fields on protocol endpoints.
+
+Reject duplicate and missing JSON fields and trailing JSON values. Token encoding and callback/reconciliation HMAC headers must follow the exact canonical grammar in `SPEC.md`: no Base64 padding, uppercase signature hex, whitespace, reordered fields, duplicate fields, unknown components, leading-zero timestamps, or alternate authentication schemes.
 
 Start and portal tokens require integer `iat` and `exp`, `exp > iat`, a maximum 15-minute lifetime, bounded future issue time, and the specification's clock-skew validation. The first accepted checkout ID is immutably bound to its plan, normalized return URL, processor, and request fingerprint. Conflicting reuse fails; exact replay resumes with the same provider idempotency key.
 

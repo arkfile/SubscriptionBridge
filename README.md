@@ -67,7 +67,9 @@ The pairing root derives separate keys for:
 - Bridge-to-consumer callbacks
 - Consumer-to-bridge reconciliation requests
 
-The configured pairing root is exactly 64 lowercase hexadecimal characters representing 32 bytes. It is strictly validated, hex-decoded, and never used directly as an HMAC key.
+The configured pairing root is exactly 64 lowercase hexadecimal characters representing 32 bytes. It is strictly validated, hex-decoded, and never used directly as an HMAC key. Protocol v1 has exactly one active root and no overlapping previous-root verification window.
+
+Opaque `checkout_id`, `subscription_ref`, and `event_id` values use their exact `subchk_`, `sub_`, and `evt_` prefixes, followed by a non-empty ASCII `[A-Za-z0-9_-]+` suffix, with at most 160 characters total. Token encodings and callback/reconciliation HMAC headers are canonical and fail closed on padding, whitespace, reordered or additional components, non-canonical timestamps, or uppercase signatures.
 
 See `SPEC.md` for exact payloads, validation rules, key derivation labels, golden vectors, state transitions, and retry behavior.
 
@@ -91,7 +93,7 @@ Provider behavior never leaks into the consumer protocol. `processor_family` is 
 
 ## Lifecycle and delivery guarantees
 
-- `canceled` is non-renewing but remains effective through `current_period_end`; immediate termination is `expired`.
+- `canceled` is non-renewing but remains effective through `current_period_end` and may be authoritatively restored to `active` through `subscription.renewed`; only `expired` is terminal.
 - Callbacks and snapshots use the same exact canonical-state fields and `state_changed_at` semantics.
 - Authoritative callback bodies are stored as exact bytes and reused unchanged for every retry.
 - Delivery has explicit `pending`, `delivered`, `dead_lettered`, and `abandoned` terminal states.
@@ -100,7 +102,7 @@ Provider behavior never leaks into the consumer protocol. `processor_family` is 
 - Exhausted Adyen dunning creates one fenced expiry action at the bridge's configured billing-termination deadline, independent of consumer access grace.
 - Raw provider webhook payloads are discarded after verification and normalization unless an explicitly enabled, encrypted, short-retention diagnostic quarantine is configured.
 
-The canonical cross-repository vectors and exact wire examples are in `fixtures/protocol-v1.json`.
+The canonical cross-repository vectors and exact wire examples are in `fixtures/protocol-v1.json`, introduced by [SubscriptionBridge commit `28c2c99`](https://github.com/arkfile/SubscriptionBridge/commit/28c2c9965d32a44fe2ea572c89fbc4f15662f371). Consumer mirrors must remain byte-for-byte identical and pin that source commit or a later release containing unchanged fixture bytes.
 
 ## Architecture
 
