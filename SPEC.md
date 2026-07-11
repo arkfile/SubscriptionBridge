@@ -26,7 +26,7 @@ The bridge is **not** a general billing platform: no one-off payments, no multi-
 | **Consumer app** | Your main product (e.g. a file vault, API service). Holds usernames, plan catalog, feature gates. |
 | **Subscription Bridge** | This service. Processor adapters + protocol notifier. |
 | **Processor** | Stripe or Adyen; both adapters are required for a complete v1 release. |
-| **plan_id** | Shared immutable catalog key defined by the consumer (`plan_500gb`). Bridge maps it to trusted processor configuration. |
+| **plan_id** | Shared immutable catalog key defined by the consumer (`plan_500gb`). Valid UTF-8, nonempty after Unicode whitespace trimming, and at most 128 UTF-8 bytes. Bridge maps it to trusted processor configuration. |
 | **checkout_id** | Opaque per-attempt cross-system join ID from the consumer (`subchk_<uuid>`). Only join ID sent to processor metadata. |
 | **subscription_ref** | Opaque ongoing cross-system join ID (`sub_<uuid>`). Stable across renewals. |
 | **event_id** | Opaque identifier for one immutable callback; used for idempotency and audit, not identity joining. |
@@ -109,12 +109,13 @@ Consumer signs when user initiates checkout. Bridge receives `GET /v1/start?toke
 2. `sig = HMAC-SHA256(token_key, body)` → lowercase hex.
 3. `token = base64url(body) + "." + hex(sig)` (RawURLEncoding, no padding).
 
-The token wire representation is canonical: exactly one `.` separator; an unpadded Raw URL-safe Base64 payload whose decode/re-encode is byte-identical; and exactly 64 lowercase hexadecimal signature characters. Reject Base64 padding, non-canonical Base64 spellings, uppercase hex, whitespace, extra separators, missing/duplicate/unknown JSON fields, duplicate JSON object keys, trailing JSON values, and tokens longer than 8192 bytes.
+The token wire representation is canonical: exactly one `.` separator; an unpadded Raw URL-safe Base64 payload whose decode/re-encode is byte-identical; and exactly 64 lowercase hexadecimal signature characters. Reject Base64 padding, non-canonical Base64 spellings, uppercase hex, whitespace, extra separators, missing/duplicate/unknown JSON fields, duplicate JSON object keys, trailing JSON values, and tokens longer than 8192 bytes. JSON object key order itself is not canonical; verification authenticates the received raw payload bytes and then decodes the required fields in any order.
 
 **Validation**
 
 - Verify HMAC with the HKDF-derived token key using constant-time comparison before acting on the payload.
 - Require exactly `checkout_id`, `plan_id`, `return_url`, `iat`, and `exp`; reject unknown fields and enforce the lifetime rules in section 4.
+- Require `plan_id` to be valid UTF-8, nonempty after Unicode whitespace trimming, and at most 128 bytes in its UTF-8 representation.
 - Require a normalized HTTPS `return_url`, except explicit loopback development URLs.
 - **No username field** — it and every other consumer identity field must be rejected.
 - Resolve `plan_id` and processor family from trusted configuration before accepting the checkout.
@@ -230,9 +231,9 @@ Allowed bridge callback pairs are exact: `subscription.activated` with `active` 
 - Consumer deduplicates on `event_id` (insert into `subscription_events` with UNIQUE).
 - Consumer applies a callback only when `state_version` is greater than its stored version. It records lower/equal versions as `ignored_stale` and returns 2xx.
 
-The notifier sends the exact immutable bytes stored in `payload_body`; JSONB serialization is never authoritative. Any 2xx marks delivery complete. Network failures, 408, 425, 429, and 5xx retry with full jitter over 1 minute, 5 minutes, 15 minutes, 1 hour, then a 6-hour cap. Other 4xx responses transition to `dead_lettered` because they indicate a protocol/configuration defect. Attempts continue while state is `pending` until delivery or audited operator abandonment. Alert after 1 hour and again after 24 hours. Concurrent notifiers claim rows using leases and `FOR UPDATE SKIP LOCKED`.
+Ordinary callback and snapshot JSON object key order is not protocol-canonical. Producers may serialize fields in any order, and receivers accept any order while rejecting missing, duplicate, or unknown fields. For a callback, the first serialization committed as `payload_body` becomes authoritative: the notifier signs and sends those exact immutable bytes on every attempt and never reconstructs them from JSONB. Any 2xx marks delivery complete. Network failures, 408, 425, 429, and 5xx retry with full jitter over 1 minute, 5 minutes, 15 minutes, 1 hour, then a 6-hour cap. Other 4xx responses transition to `dead_lettered` because they indicate a protocol/configuration defect. Attempts continue while state is `pending` until delivery or audited operator abandonment. Alert after 1 hour and again after 24 hours. Concurrent notifiers claim rows using leases and `FOR UPDATE SKIP LOCKED`.
 
-`event_id`, `checkout_id`, and `subscription_ref` are opaque values with the `evt_`, `subchk_`, and `sub_` prefixes respectively. In every token, callback, snapshot, URL path, and operator input, each is at most 160 ASCII characters in total and has a non-empty suffix containing only ASCII letters, digits, `_`, or `-`; equivalently, validate the exact prefix followed by `[A-Za-z0-9_-]+` and the total length bound. Every shown callback field is required; no other field is permitted. `processor_family` is intentionally absent because consumer behavior must be provider-neutral. Timestamps use second-precision UTC RFC3339 with `Z`; period end must be after start. `state_changed_at` is the time at which the canonical state represented by `state_version` was committed, never callback-send or retrieval time. The receiver must reject unknown or duplicate fields, unknown event/status values, malformed identifiers, unordered periods, and incompatible event/status pairs.
+`event_id`, `checkout_id`, and `subscription_ref` are opaque values with the `evt_`, `subchk_`, and `sub_` prefixes respectively. In every token, callback, snapshot, URL path, and operator input, each is at most 160 ASCII characters in total and has a non-empty suffix containing only ASCII letters, digits, `_`, or `-`; equivalently, validate the exact prefix followed by `[A-Za-z0-9_-]+` and the total length bound. Every callback and snapshot `plan_id` obeys the same valid-UTF-8, trimmed-nonempty, 128-byte rule as the start token. Every shown callback field is required; no other field is permitted. `processor_family` is intentionally absent because consumer behavior must be provider-neutral. Timestamps use second-precision UTC RFC3339 with `Z`; period end must be after start. `state_changed_at` is the time at which the canonical state represented by `state_version` was committed, never callback-send or retrieval time. The receiver must reject unknown or duplicate fields, unknown event/status values, malformed identifiers, unordered periods, and incompatible event/status pairs.
 
 ### 5.4 Subscription snapshot (consumer → bridge, server-to-server)
 
@@ -436,7 +437,7 @@ CREATE DOMAIN sb_utc_second AS TIMESTAMPTZ
 
 CREATE TABLE sb_checkouts (
     checkout_id TEXT PRIMARY KEY,
-    plan_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL CHECK (octet_length(plan_id) BETWEEN 1 AND 128),
     normalized_return_url TEXT NOT NULL,
     processor_family TEXT NOT NULL CHECK (processor_family IN ('stripe', 'adyen')),
     request_fingerprint BYTEA NOT NULL CHECK (octet_length(request_fingerprint) = 32),
@@ -454,7 +455,7 @@ CREATE TABLE sb_checkouts (
 CREATE TABLE sb_subscriptions (
     subscription_ref TEXT PRIMARY KEY,
     checkout_id TEXT NOT NULL UNIQUE REFERENCES sb_checkouts(checkout_id),
-    plan_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL CHECK (octet_length(plan_id) BETWEEN 1 AND 128),
     status TEXT NOT NULL CHECK (status IN ('active', 'trialing', 'past_due', 'canceled', 'expired')),
     state_version BIGINT NOT NULL CHECK (state_version >= 1),
     processor_family TEXT NOT NULL CHECK (processor_family IN ('stripe', 'adyen')),
@@ -743,7 +744,7 @@ plans:
       country_code: DE
 ```
 
-`plan_id` keys must match consumer catalog rows. Amount and currency are immutable for an existing plan ID; changing either requires a new plan ID. Checkout processor selection is deterministic: the plan's optional `processor`, otherwise `default_processor`. Both selected providers must have a complete configuration and adapter. Provider selection must not come from user-controlled query parameters.
+`plan_id` keys must match consumer catalog rows and obey the protocol UTF-8, trimmed-nonempty, and 128-byte limit. Application validation enforces Unicode whitespace trimming; the database byte-length constraints provide defense in depth. Amount and currency are immutable for an existing plan ID; changing either requires a new plan ID. Checkout processor selection is deterministic: the plan's optional `processor`, otherwise `default_processor`. Both selected providers must have a complete configuration and adapter. Provider selection must not come from user-controlled query parameters.
 
 ---
 
@@ -1070,7 +1071,7 @@ subscription-bridge/
 
 ## 20. Status
 
-**Greenfield — specification repository created; provider implementation has not begun.** Arkfile's consumer currently implements the earlier protocol draft and requires the atomic compatibility update described by the canonical fixture and this specification. Finalize and test the protocol, migrations, schemas, interfaces, state machines, and crash-recovery behavior before implementing either provider. Stripe and Adyen are both required v1 adapters and must pass the common conformance suite before release.
+**Greenfield — specification repository created; provider implementation has not begun.** Arkfile's consumer implements current protocol v1 and passes the canonical fixture tests. Finalize and test the bridge migrations, protocol package, schemas, interfaces, state machines, and crash-recovery behavior before implementing either provider. Stripe and Adyen are both required v1 adapters and must pass the common conformance suite before release.
 
 ---
 

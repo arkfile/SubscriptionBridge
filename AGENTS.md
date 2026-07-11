@@ -42,7 +42,7 @@ The only cross-system join identifiers are:
 - `checkout_id`
 - `subscription_ref`
 
-Both identifiers must be opaque and must not encode usernames, email addresses, sequential account IDs, tenant names, or other identifying information. `plan_id` is a shared catalog key. `event_id` is an idempotency and audit identifier. Neither should be described as an identity join key.
+Both identifiers must be opaque and must not encode usernames, email addresses, sequential account IDs, tenant names, or other identifying information. `plan_id` is a shared catalog key that must be valid UTF-8, nonempty after Unicode whitespace trimming, and at most 128 UTF-8 bytes. `event_id` is an idempotency and audit identifier. Neither should be described as an identity join key.
 
 Every protocol occurrence of `checkout_id`, `subscription_ref`, or `event_id` must use its exact `subchk_`, `sub_`, or `evt_` prefix, a non-empty suffix containing only ASCII letters, digits, `_`, or `-`, and a maximum total length of 160 characters.
 
@@ -244,7 +244,7 @@ Do not duplicate security-sensitive constants across packages.
 
 The current fixture source is commit `28c2c9965d32a44fe2ea572c89fbc4f15662f371`. Protocol conformance tests must consume the fixture directly rather than duplicate expected keys, signatures, headers, or JSON bytes.
 
-Plan amount and currency are immutable for an existing `plan_id`. Changing either requires a new plan ID.
+Plan amount and currency are immutable for an existing valid `plan_id`. Changing either requires a new plan ID.
 
 Provider selection must come from trusted configuration. Do not accept provider selection from user-controlled query parameters.
 
@@ -256,7 +256,7 @@ Apply bounded request bodies, bounded response bodies, server timeouts, client t
 
 Reject unknown JSON fields on protocol endpoints.
 
-Reject duplicate and missing JSON fields and trailing JSON values. Token encoding and callback/reconciliation HMAC headers must follow the exact canonical grammar in `SPEC.md`: no Base64 padding, uppercase signature hex, whitespace, reordered fields, duplicate fields, unknown components, leading-zero timestamps, or alternate authentication schemes.
+Reject duplicate and missing JSON fields and trailing JSON values, but accept ordinary protocol JSON fields in any order. Once a callback's serialized bytes are committed to `payload_body`, those exact bytes are authoritative for signing and every retry. Token encoding and callback/reconciliation HMAC headers must follow the exact canonical grammar in `SPEC.md`: no Base64 padding, uppercase signature hex, whitespace, reordered header components, duplicate header components, unknown header components, leading-zero timestamps, or alternate authentication schemes.
 
 Start and portal tokens require integer `iat` and `exp`, `exp > iat`, a maximum 15-minute lifetime, bounded future issue time, and the specification's clock-skew validation. The first accepted checkout ID is immutably bound to its plan, normalized return URL, processor, and request fingerprint. Conflicting reuse fails; exact replay resumes with the same provider idempotency key.
 

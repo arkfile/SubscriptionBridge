@@ -8,6 +8,7 @@ The bridge and its processors must never receive consumer usernames or other con
 
 Subscription Bridge is a greenfield project under active development. There are no production deployments and no backward-compatibility requirements unless explicitly documented.
 The normative implementation contract is `SPEC.md`. Where this README and `SPEC.md` differ, `SPEC.md` takes precedence.
+Arkfile's consumer implementation supports current protocol v1 and passes the canonical cross-repository fixture tests.
 
 ## Core Responsibilities
 
@@ -70,6 +71,8 @@ The pairing root derives separate keys for:
 The configured pairing root is exactly 64 lowercase hexadecimal characters representing 32 bytes. It is strictly validated, hex-decoded, and never used directly as an HMAC key. Protocol v1 has exactly one active root and no overlapping previous-root verification window.
 
 Opaque `checkout_id`, `subscription_ref`, and `event_id` values use their exact `subchk_`, `sub_`, and `evt_` prefixes, followed by a non-empty ASCII `[A-Za-z0-9_-]+` suffix, with at most 160 characters total. Token encodings and callback/reconciliation HMAC headers are canonical and fail closed on padding, whitespace, reordered or additional components, non-canonical timestamps, or uppercase signatures.
+
+`plan_id` is valid UTF-8, nonempty after Unicode whitespace trimming, and at most 128 bytes in its UTF-8 representation. Ordinary callback and snapshot JSON key order is not canonical; the exact callback bytes first committed to the outbox become authoritative for signing and retries.
 
 See `SPEC.md` for exact payloads, validation rules, key derivation labels, golden vectors, state transitions, and retry behavior.
 
