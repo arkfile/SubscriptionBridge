@@ -6,11 +6,17 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/arkfile/SubscriptionBridge/internal/adapters"
+	adyenadapter "github.com/arkfile/SubscriptionBridge/internal/adapters/adyen"
+	stripeadapter "github.com/arkfile/SubscriptionBridge/internal/adapters/stripe"
+	"github.com/arkfile/SubscriptionBridge/internal/config"
+	"github.com/arkfile/SubscriptionBridge/internal/engine"
+	"github.com/arkfile/SubscriptionBridge/internal/protocol"
 	"github.com/arkfile/SubscriptionBridge/internal/store"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// QA / TODO: scheduler-status and reconcile print ok; resolve-attempt is not implemented.
+// main is the operator CLI for schema, inspection, delivery, and attempt resolution.
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -43,9 +49,9 @@ func main() {
 				return err
 			}
 			return printJSON(map[string]any{
-				"checkout_id": c.CheckoutID,
-				"status":      c.Status,
-				"plan_id":     c.PlanID,
+				"checkout_id":      c.CheckoutID,
+				"status":           c.Status,
+				"plan_id":          c.PlanID,
 				"subscription_ref": c.SubscriptionRef,
 			})
 		})
@@ -57,15 +63,20 @@ func main() {
 				return err
 			}
 			return printJSON(map[string]any{
-				"subscription_ref": s.SubscriptionRef,
-				"status":           s.Status,
-				"state_version":    s.StateVersion,
-				"plan_id":          s.PlanID,
+				"subscription_ref":             s.SubscriptionRef,
+				"status":                       s.Status,
+				"state_version":                s.StateVersion,
+				"plan_id":                      s.PlanID,
+				"processor_family":             s.ProcessorFamily,
+				"processor_customer_id":        s.ProcessorCustomerID,
+				"processor_subscription_id":    s.ProcessorSubscriptionID,
+				"processor_initial_payment_id": s.ProcessorInitialPaymentID,
+				"automatic_charging_blocked":   s.AutomaticChargingBlocked,
 			})
 		})
 	case "list-events":
 		state := ""
-		if len(os.Args) > 2 {
+		if len(os.Args) > 2 && os.Args[2] != "--reason" {
 			state = os.Args[2]
 		}
 		withTx(ctx, func(tx store.Tx) error {
@@ -81,21 +92,69 @@ func main() {
 		})
 	case "requeue-event":
 		requireArgs(3)
-		reason := flagReason()
+		reason := flagValue("--reason", "operator")
 		withTx(ctx, func(tx store.Tx) error {
 			return tx.RequeueOutbound(os.Args[2], reason, "cli", tx.Now())
 		})
 	case "abandon-event":
 		requireArgs(3)
-		reason := flagReason()
+		reason := flagValue("--reason", "operator")
 		withTx(ctx, func(tx store.Tx) error {
 			return tx.AbandonOutbound(os.Args[2], reason, "cli", tx.Now())
 		})
 	case "scheduler-status":
-		// QA / TODO: stub; does not report scheduler leases or due actions.
-		fmt.Println("ok")
+		withTx(ctx, func(tx store.Tx) error {
+			actions, err := tx.ListActions(200)
+			if err != nil {
+				return err
+			}
+			attempts, err := tx.ListAttempts([]string{"uncertain", "manual_review", "running", "prepared"}, 200)
+			if err != nil {
+				return err
+			}
+			return printJSON(map[string]any{
+				"actions":  summarizeActions(actions),
+				"attempts": summarizeAttempts(attempts),
+			})
+		})
 	case "reconcile":
-		// QA / TODO: stub; does not compare local vs provider state.
+		eng, cleanup := mustEngine(ctx)
+		defer cleanup()
+		err := eng.Store.InTx(ctx, func(tx store.Tx) error {
+			subs, err := tx.ListSubscriptions(200)
+			if err != nil {
+				return err
+			}
+			rows := make([]map[string]any, 0, len(subs))
+			for _, sub := range subs {
+				row := map[string]any{
+					"subscription_ref": sub.SubscriptionRef,
+					"local_status":     sub.Status,
+					"state_version":    sub.StateVersion,
+				}
+				if ad, ok := eng.Adapters[sub.ProcessorFamily]; ok && ad != nil && sub.ProcessorSubscriptionID != nil {
+					st, err := ad.GetSubscription(ctx, adapters.ProcessorSubscription{
+						Family:                  sub.ProcessorFamily,
+						ProcessorSubscriptionID: *sub.ProcessorSubscriptionID,
+					})
+					if err == nil && st != nil {
+						row["provider_status"] = st.Status
+					}
+				}
+				rows = append(rows, row)
+			}
+			return printJSON(rows)
+		})
+		if err != nil {
+			fail(err)
+		}
+	case "resolve-attempt":
+		requireArgs(3)
+		eng, cleanup := mustEngine(ctx)
+		defer cleanup()
+		if err := eng.ResolveAttempt(ctx, os.Args[2], flagValue("--outcome", ""), flagValue("--reason", "operator"), "cli", flagValue("--payment-id", "")); err != nil {
+			fail(err)
+		}
 		fmt.Println("ok")
 	default:
 		usage()
@@ -105,7 +164,7 @@ func main() {
 
 // usage prints supported CLI commands.
 func usage() {
-	fmt.Fprintln(os.Stderr, `bridge-cli migrate|health|show-checkout|show-subscription|list-events|requeue-event|abandon-event|scheduler-status|reconcile`)
+	fmt.Fprintln(os.Stderr, `bridge-cli migrate|health|show-checkout|show-subscription|list-events|requeue-event|abandon-event|scheduler-status|reconcile|resolve-attempt`)
 }
 
 // mustPool opens a PostgreSQL pool from BRIDGE_DATABASE_URL.
@@ -119,6 +178,25 @@ func mustPool(ctx context.Context) *pgxpool.Pool {
 		fail(err)
 	}
 	return pool
+}
+
+// mustEngine loads config and adapters for operator commands that need provider access.
+func mustEngine(ctx context.Context) (*engine.Engine, func()) {
+	cfg, err := config.Load()
+	if err != nil {
+		fail(err)
+	}
+	_ = cfg.LoadCatalog()
+	pool := mustPool(ctx)
+	db := store.NewPostgres(pool, nil)
+	ads := map[string]adapters.ProcessorAdapter{}
+	if cfg.StripeSecretKey != "" {
+		ads[protocol.ProcessorStripe] = stripeadapter.New(cfg.StripeSecretKey, cfg.StripeWebhookSecret)
+	}
+	if cfg.AdyenAPIKey != "" {
+		ads[protocol.ProcessorAdyen] = adyenadapter.New(cfg.AdyenAPIKey, cfg.AdyenHMACKey, cfg.AdyenEnvironment, cfg.AdyenLivePrefix)
+	}
+	return &engine.Engine{Store: db, Config: cfg, Adapters: ads}, func() { pool.Close() }
 }
 
 // withTx runs fn in a PostgreSQL transaction and exits on error.
@@ -146,14 +224,44 @@ func requireArgs(n int) {
 	}
 }
 
-// flagReason returns --reason or the default operator reason.
-func flagReason() string {
+// flagValue returns the value following name, or fallback.
+func flagValue(name, fallback string) string {
 	for i, a := range os.Args {
-		if a == "--reason" && i+1 < len(os.Args) {
+		if a == name && i+1 < len(os.Args) {
 			return os.Args[i+1]
 		}
 	}
-	return "operator"
+	return fallback
+}
+
+// summarizeActions returns bounded operator fields for scheduled actions.
+func summarizeActions(in []store.ScheduledAction) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, a := range in {
+		out = append(out, map[string]any{
+			"action_id":        a.ActionID,
+			"subscription_ref": a.SubscriptionRef,
+			"action_type":      a.ActionType,
+			"status":           a.Status,
+			"due_at":           a.DueAt,
+			"fencing_token":    a.FencingToken,
+		})
+	}
+	return out
+}
+
+// summarizeAttempts returns bounded operator fields for charge attempts.
+func summarizeAttempts(in []store.ChargeAttempt) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, a := range in {
+		out = append(out, map[string]any{
+			"attempt_id":       a.AttemptID,
+			"subscription_ref": a.SubscriptionRef,
+			"status":           a.Status,
+			"attempt_number":   a.AttemptNumber,
+		})
+	}
+	return out
 }
 
 // fail prints a concise error and exits 1 without leaking internals.

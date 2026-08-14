@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -13,12 +14,15 @@ import (
 )
 
 type Adapter struct {
-	mu        sync.Mutex
-	FamilyName string
-	Sessions  map[string]string
-	Subs      map[string]adapters.SubscriptionState
-	FailNext  error
-	Uncertain bool
+	mu                sync.Mutex
+	FamilyName        string
+	Sessions          map[string]string
+	Subs              map[string]adapters.SubscriptionState
+	FailNext          error
+	Uncertain         bool
+	LastCharge        adapters.RenewalRequest
+	LastPaymentUpdate adapters.PaymentUpdateRequest
+	ChargeResult      *adapters.RenewalResult
 }
 
 // New constructs an in-process fake processor for tests.
@@ -63,6 +67,29 @@ func (a *Adapter) CreatePortalSession(_ context.Context, processorCustomerID, re
 	return returnURL + "/portal", nil
 }
 
+// CreatePaymentUpdateSession returns a local fake Checkout Session for Drop-in tests.
+func (a *Adapter) CreatePaymentUpdateSession(_ context.Context, request adapters.PaymentUpdateRequest) (adapters.PaymentUpdateSession, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.LastPaymentUpdate = request
+	if a.FailNext != nil {
+		err := a.FailNext
+		a.FailNext = nil
+		return adapters.PaymentUpdateSession{}, err
+	}
+	if request.ShopperRef == "" || request.CheckoutID == "" {
+		return adapters.PaymentUpdateSession{}, fmt.Errorf("missing shopper or checkout")
+	}
+	return adapters.PaymentUpdateSession{ID: "CS_fake", SessionData: "session_fake"}, nil
+}
+
+// PaymentUpdate returns the last Drop-in session request.
+func (a *Adapter) PaymentUpdate() adapters.PaymentUpdateRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.LastPaymentUpdate
+}
+
 // ParseWebhook accepts a simplified JSON fixture as a normalized event.
 func (a *Adapter) ParseWebhook(_ context.Context, _ http.Header, body []byte) ([]adapters.NormalizedEvent, error) {
 	var payload struct {
@@ -75,6 +102,7 @@ func (a *Adapter) ParseWebhook(_ context.Context, _ http.Header, body []byte) ([
 		PaymentID  string `json:"processor_payment_id"`
 		Success    bool   `json:"success"`
 		Status     string `json:"provider_status"`
+		Token      string `json:"token"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
@@ -119,6 +147,7 @@ func (a *Adapter) ParseWebhook(_ context.Context, _ http.Header, body []byte) ([
 		PayloadHash:       sum,
 		OccurredAt:        time.Now().UTC(),
 		Fields:            fields,
+		SensitivePlain:    []byte(payload.Token),
 	}}, nil
 }
 
@@ -140,25 +169,61 @@ func (a *Adapter) GetSubscription(_ context.Context, subscription adapters.Proce
 	return &st, nil
 }
 
-// QA / TODO: no-op fake; does not record cancellation on injected state.
-func (a *Adapter) CancelSubscription(context.Context, adapters.ProcessorSubscription, bool) error {
+// CancelSubscription records cancellation on injected fake state.
+func (a *Adapter) CancelSubscription(_ context.Context, subscription adapters.ProcessorSubscription, atPeriodEnd bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if st, ok := a.Subs[subscription.ProcessorSubscriptionID]; ok {
+		st.CancelAtPeriodEnd = atPeriodEnd
+		if !atPeriodEnd {
+			st.ImmediateCancel = true
+			st.Status = protocol.StatusExpired
+		} else {
+			st.CancelAtPeriodEnd = true
+			st.Status = protocol.StatusCanceled
+		}
+		a.Subs[subscription.ProcessorSubscriptionID] = st
+	}
 	return nil
 }
 
 // ChargeRenewal returns a fake authorised charge, or ErrProviderManaged for Stripe.
-func (a *Adapter) ChargeRenewal(context.Context, adapters.RenewalRequest) (adapters.RenewalResult, error) {
+func (a *Adapter) ChargeRenewal(_ context.Context, request adapters.RenewalRequest) (adapters.RenewalResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.LastCharge = request
 	if a.FamilyName == protocol.ProcessorStripe {
 		return adapters.RenewalResult{}, adapters.ErrProviderManaged
+	}
+	if a.FailNext != nil {
+		err := a.FailNext
+		a.FailNext = nil
+		return adapters.RenewalResult{Uncertain: a.Uncertain || adapters.IsTimeout(err)}, err
+	}
+	if a.Uncertain {
+		return adapters.RenewalResult{Uncertain: true}, nil
+	}
+	if a.ChargeResult != nil {
+		return *a.ChargeResult, nil
 	}
 	return adapters.RenewalResult{Status: "authorized", ProcessorPaymentID: "pay_fake"}, nil
 }
 
-// ResolveRenewalAttempt returns a fake authorised resolution, or ErrProviderManaged for Stripe.
-func (a *Adapter) ResolveRenewalAttempt(context.Context, adapters.RenewalAttempt) (adapters.RenewalResolution, error) {
-	if a.FamilyName == protocol.ProcessorStripe {
-		return adapters.RenewalResolution{}, adapters.ErrProviderManaged
-	}
-	return adapters.RenewalResolution{Status: "authorized", ProcessorPaymentID: "pay_fake"}, nil
+// ResolveRenewalAttempt replays the last fake charge, or ErrProviderManaged for Stripe.
+func (a *Adapter) ResolveRenewalAttempt(ctx context.Context, attempt adapters.RenewalAttempt) (adapters.RenewalResolution, error) {
+	res, err := a.ChargeRenewal(ctx, adapters.RenewalRequest{
+		Endpoint:         attempt.Endpoint,
+		APIVersion:       attempt.APIVersion,
+		IdempotencyKey:   attempt.IdempotencyKey,
+		CanonicalBody:    attempt.CanonicalBody,
+		AttemptReference: attempt.AttemptRef,
+	})
+	return adapters.RenewalResolution{
+		Status:             res.Status,
+		ProcessorPaymentID: res.ProcessorPaymentID,
+		RefusalCode:        res.RefusalCode,
+		Uncertain:          res.Uncertain,
+	}, err
 }
 
 // SetSub injects authoritative subscription state for tests.

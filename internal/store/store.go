@@ -58,17 +58,26 @@ type Tx interface {
 	ReleaseProcessorLease(key, claimToken string, fence int64) error
 
 	InsertAction(a ScheduledAction) error
+	GetAction(id string) (ScheduledAction, error)
 	GetActionByKey(key string) (ScheduledAction, error)
-	ClaimDueAction(now time.Time, lease time.Duration, kinds ...string) (ScheduledAction, error)
+	LockDueAction(now time.Time, status string, kinds ...string) (ScheduledAction, error)
+	ClaimAction(actionID string, now time.Time, lease time.Duration) (ScheduledAction, error)
+	ClaimDueAction(now time.Time, lease time.Duration, status string, kinds ...string) (ScheduledAction, error)
 	FinishAction(actionID, claimToken string, fence int64, status string, dueAt *time.Time, errClass *string) error
+	ForceFinishAction(actionID, status string, dueAt *time.Time, errClass *string) error
 	CancelActionsForSubscription(ref, exceptKey string) error
+	ListActions(limit int) ([]ScheduledAction, error)
 
 	InsertAttempt(a ChargeAttempt) error
 	GetAttempt(id string) (ChargeAttempt, error)
+	GetAttemptByReference(ref string) (ChargeAttempt, error)
 	GetAttemptsForAction(actionID string) ([]ChargeAttempt, error)
+	ListAttempts(statuses []string, limit int) ([]ChargeAttempt, error)
 	UpdateAttempt(a ChargeAttempt) error
-	ClaimAttemptWithAction(actionID, attemptID, claimToken string, fence int64, now time.Time, lease time.Duration) (ScheduledAction, ChargeAttempt, error)
+	ClaimAttemptWithAction(actionID, attemptID, claimToken string, fence int64, now time.Time, lease time.Duration, resolutionDeadline time.Time) (ScheduledAction, ChargeAttempt, error)
 
+	ListSubscriptions(limit int) ([]Subscription, error)
+	LatestOutbound(subscriptionRef string) (OutboundEvent, error)
 	InsertAudit(a Audit) error
 }
 

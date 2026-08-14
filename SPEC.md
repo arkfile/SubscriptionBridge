@@ -173,7 +173,7 @@ Consumer signs when user opens manage/cancel portal.
 }
 ```
 
-Same signing, exact-field decoding, timestamp validation, and URL validation as the start token. Bridge looks up `subscription_ref` → processor customer, creates or resumes the appropriate portal session, and redirects the browser.
+Same signing, exact-field decoding, timestamp validation, and URL validation as the start token. Bridge looks up `subscription_ref`. Stripe creates a Billing Portal session and redirects the browser. Adyen renders the bridge-hosted portal.
 
 ### 5.3 Callback (bridge → consumer)
 
@@ -279,7 +279,10 @@ The reconcile request uses the HKDF-derived reconcile key. The bridge returns th
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/v1/start` | Validate start token; create processor checkout; redirect |
-| GET | `/v1/portal` | Validate portal token; create processor portal session; redirect |
+| GET | `/v1/portal` | Validate portal token; Stripe Billing redirect or Adyen hosted portal |
+| GET | `/v1/portal/assets/portal.css` | Hosted Adyen portal chrome stylesheet |
+| GET | `/v1/portal/assets/portal.js` | Hosted Adyen Drop-in init script |
+| POST | `/v1/portal/cancel` | CSRF-protected cancel-at-period-end or immediate cancel |
 | GET | `/health` | Liveness (+ DB ping in production) |
 
 ### 6.2 Processor webhooks
@@ -304,7 +307,7 @@ An optional diagnostic quarantine must be explicitly enabled, separately access-
 | `adyen.contract_changed` | `processor_payment_id`, `provider_status`, `provider_occurred_at` | none |
 | `adyen.operational_adjustment` | `processor_payment_id`, `provider_status`, `provider_occurred_at` | none |
 
-No other key or normalized kind is permitted in v1. A stored-payment-method reference from a verified successful initial Adyen event goes only into the event's authenticated-encrypted sensitive fields and is moved or re-encrypted into the subscription in the state transaction.
+No other key or normalized kind is permitted in v1. A stored-payment-method reference from a verified successful Adyen `AUTHORISATION` (initial checkout or payment-method replacement) goes only into the event's authenticated-encrypted sensitive fields and is re-encrypted onto the subscription in the state transaction using payment-method authenticated context. Payment-method replacement must not consume a consumer-visible `state_version`. The adapter may read Adyen `metadata.checkout_id` to populate `checkout_id` and must not persist metadata maps.
 
 `provider_event_type` is the provider-native bounded event label retained for audit and adapter fixture selection; `normalized_kind` is the closed provider-neutral processing taxonomy above. Engine transition code switches only on `normalized_kind` and its validated shape. `provider_occurred_at` is the provider-asserted event time normalized to second-precision UTC RFC3339. It is audit context, not a trustworthy ordering token, and must never override authoritative retrieval, fencing, local period monotonicity, or terminal-state guards.
 
@@ -706,6 +709,7 @@ type ProcessorAdapter interface {
     Family() string
     CreateCheckout(ctx context.Context, request CheckoutRequest) (CheckoutResult, error)
     CreatePortalSession(ctx context.Context, processorCustomerID, returnURL string) (portalURL string, err error)
+    CreatePaymentUpdateSession(ctx context.Context, request PaymentUpdateRequest) (PaymentUpdateSession, error)
     ParseWebhook(ctx context.Context, headers http.Header, body []byte) ([]NormalizedEvent, error)
     GetSubscription(ctx context.Context, subscription ProcessorSubscription) (*SubscriptionState, error)
     CancelSubscription(ctx context.Context, subscription ProcessorSubscription, atPeriodEnd bool) error
@@ -714,7 +718,7 @@ type ProcessorAdapter interface {
 }
 ```
 
-`ChargeRenewal` and `ResolveRenewalAttempt` return `ErrProviderManaged` for Stripe. For Adyen, `ResolveRenewalAttempt` may only replay the stored exact request to the persisted endpoint and API version using the same idempotency key, or correlate an authenticated webhook by the stable attempt reference. It must not claim a provider lookup capability that has not been verified against a specific supported Adyen API. `CreatePortalSession` uses Stripe Billing Portal for Stripe and the bridge-hosted portal for Adyen. The subscription engine is the only component allowed to map `NormalizedEvent` into state changes and protocol callbacks.
+`ChargeRenewal`, `ResolveRenewalAttempt`, and `CreatePaymentUpdateSession` return `ErrProviderManaged` for Stripe. For Adyen, `ResolveRenewalAttempt` may only replay the stored exact request to the persisted endpoint and API version using the same idempotency key, or correlate an authenticated webhook by the stable attempt reference. It must not claim a provider lookup capability that has not been verified against a specific supported Adyen API. `CreatePortalSession` uses Stripe Billing Portal for Stripe and the bridge-hosted portal for Adyen. `CreatePaymentUpdateSession` creates an Adyen Checkout Session bound to the existing shopper reference for Drop-in payment-method replacement. The subscription engine is the only component allowed to map `NormalizedEvent` into state changes and protocol callbacks.
 
 ### 9.1 Plan SKU config (`config/plans.yaml`)
 
@@ -861,7 +865,11 @@ Resolve `adyen.contract_changed` only by a unique match of its `processor_paymen
 
 **Bridge-hosted portal**
 
-The signed `/v1/portal` route renders a bridge page that supports cancel-at-period-end, immediate cancel (operator-policy controlled), and payment-method replacement through Adyen Drop-in. CSRF protection and the short-lived portal token are mandatory. No processor identifier is exposed in HTML or URLs. Cancel-at-period-end locks the subscription row, sets `canceled`, creates the unique expiry action, increments `state_version`, and emits `subscription.canceled` atomically. The expiry action emits `subscription.expired` at period end. Immediate cancellation transitions directly to `expired`.
+The signed `/v1/portal` route renders a bridge page that supports cancel-at-period-end, immediate cancel (operator-policy controlled), and payment-method replacement through Adyen Drop-in. CSRF protection and the short-lived portal token are mandatory. Shopper references, `subscription_ref`, and other processor identifiers must not appear as page chrome or in URLs. Drop-in requires a Checkout `session.id` and `sessionData` in page JSON; those values must not be displayed as readable chrome.
+
+Payment-method replacement creates a Checkout Session for the **existing** shopper reference with `storePaymentMethod=true`, `shopperInteraction=Ecommerce`, `recurringProcessingModel=Subscription`, and a zero-value amount so the replacement does not collect a plan charge. The Adyen merchant reference uses the operational `sbpm_` prefix and is not a consumer protocol identifier. Session metadata carries the original `checkout_id` so a later `AUTHORISATION` webhook can be normalized as `adyen.initial_authorisation` without allocating a new shopper. A successful replacement re-encrypts the new stored-payment-method reference onto the subscription, clears `automatic_charging_blocked`, writes an operator audit row, and does not emit a consumer callback.
+
+Cancel-at-period-end locks the subscription row, sets `canceled`, creates the unique expiry action, increments `state_version`, and emits `subscription.canceled` atomically. The expiry action emits `subscription.expired` at period end. Immediate cancellation transitions directly to `expired`.
 
 ---
 
@@ -883,6 +891,7 @@ STRIPE_WEBHOOK_SECRET=
 # Adyen
 ADYEN_API_KEY=
 ADYEN_HMAC_KEY=
+ADYEN_CLIENT_KEY=
 ADYEN_LIVE_PREFIX=
 ADYEN_ENVIRONMENT=test
 ADYEN_DATA_ENCRYPTION_KEY=
@@ -902,6 +911,8 @@ BRIDGE_ADYEN_RESOLUTION_DEADLINE=144h
 BRIDGE_PROVIDER_PAYLOAD_QUARANTINE_ENABLED=false
 BRIDGE_PROVIDER_PAYLOAD_QUARANTINE_MAX_RETENTION=168h
 ```
+
+`ADYEN_CLIENT_KEY` is Adyen's public client key used by Drop-in on the hosted portal. It is required when any configured plan selects Adyen and may appear in the portal page. It is not a substitute for `ADYEN_API_KEY`.
 
 **Consumer mirror (example Arkfile):**
 

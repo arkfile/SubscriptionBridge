@@ -18,7 +18,10 @@ import (
 	"github.com/arkfile/SubscriptionBridge/internal/store"
 )
 
-var errUnknownStripePrice = errors.New("unknown stripe price id")
+var (
+	errUnknownStripePrice = errors.New("unknown stripe price id")
+	errManualReview       = errors.New("provider event requires manual review")
+)
 
 type Engine struct {
 	Store    store.Store
@@ -174,18 +177,18 @@ func (e *Engine) StartCheckout(ctx context.Context, token string) (StartResult, 
 // checkoutRequest builds the adapter checkout request from bound checkout state.
 func (e *Engine) checkoutRequest(c store.Checkout, plan config.Plan, family string) adapters.CheckoutRequest {
 	req := adapters.CheckoutRequest{
-		CheckoutID:     c.CheckoutID,
-		PlanID:         c.PlanID,
-		ReturnURL:      c.NormalizedReturnURL,
-		IdempotencyKey: c.ProviderIdempotencyKey,
-		AmountMinor:    plan.AmountMinor,
-		Currency:       plan.Currency,
-		Interval:       plan.Interval,
-		StripePriceID:  plan.Stripe.PriceID,
+		CheckoutID:      c.CheckoutID,
+		PlanID:          c.PlanID,
+		ReturnURL:       c.NormalizedReturnURL,
+		IdempotencyKey:  c.ProviderIdempotencyKey,
+		AmountMinor:     plan.AmountMinor,
+		Currency:        plan.Currency,
+		Interval:        plan.Interval,
+		StripePriceID:   plan.Stripe.PriceID,
 		MerchantAccount: plan.Adyen.MerchantAccount,
-		CountryCode:    plan.Adyen.CountryCode,
-		PublicBaseURL:  e.Config.PublicURL,
-		ExpiresAt:      c.ExpiresAt,
+		CountryCode:     plan.Adyen.CountryCode,
+		PublicBaseURL:   e.Config.PublicURL,
+		ExpiresAt:       c.ExpiresAt,
 	}
 	if c.ProcessorShopperReference != nil {
 		req.ShopperRef = *c.ProcessorShopperReference
@@ -275,6 +278,9 @@ func (e *Engine) commitChange(tx store.Tx, current, next store.Subscription, eve
 		if err != nil {
 			return err
 		}
+		if err := tx.CancelActionsForSubscription(next.SubscriptionRef, key); err != nil {
+			return err
+		}
 		if err := tx.InsertAction(store.ScheduledAction{
 			ActionID:        aid,
 			ActionKey:       key,
@@ -308,7 +314,7 @@ func (e *Engine) commitChange(tx store.Tx, current, next store.Subscription, eve
 			return err
 		}
 	}
-	if eventType == protocol.EventExpired || eventType == protocol.EventRenewed {
+	if eventType == protocol.EventExpired {
 		if err := tx.CancelActionsForSubscription(next.SubscriptionRef, ""); err != nil {
 			return err
 		}
@@ -424,8 +430,15 @@ func (e *Engine) processNormalized(ctx context.Context, ad adapters.ProcessorAda
 		}
 		subRef, applyErr := e.applyObservation(tx, ev, state, now)
 		if applyErr != nil {
-			if errors.Is(applyErr, errUnknownStripePrice) {
-				if err := tx.FinishProcessorEvent(ev.ProcessorFamily, ev.ProcessorEventID, *cur.ClaimToken, cur.FencingToken, "quarantined", subRef, now); err != nil {
+			state := ""
+			switch {
+			case errors.Is(applyErr, errUnknownStripePrice):
+				state = "quarantined"
+			case errors.Is(applyErr, errManualReview):
+				state = "manual_review"
+			}
+			if state != "" {
+				if err := tx.FinishProcessorEvent(ev.ProcessorFamily, ev.ProcessorEventID, *cur.ClaimToken, cur.FencingToken, state, subRef, now); err != nil {
 					return err
 				}
 				return tx.ReleaseProcessorLease(processingKey, *lease.ClaimToken, lease.FencingToken)
@@ -573,7 +586,7 @@ func (e *Engine) applyAdyenInitial(tx store.Tx, ev adapters.NormalizedEvent, now
 		return nil, err
 	}
 	if co.Status == protocol.CheckoutCompleted && co.SubscriptionRef != nil {
-		return co.SubscriptionRef, nil
+		return e.replaceStoredPaymentMethod(tx, *co.SubscriptionRef, ev, now)
 	}
 	ref, err := protocol.NewSubscriptionRef()
 	if err != nil {
@@ -583,14 +596,8 @@ func (e *Engine) applyAdyenInitial(tx store.Tx, ev adapters.NormalizedEvent, now
 	periodStart := now
 	periodEnd := protocol.AddCalendarMonths(periodStart, 1)
 	created := FirstActivation(co, ref, protocol.StatusActive, periodStart, periodEnd, now, nil, nil, strPtr(payID), co.ProcessorShopperReference)
-	if len(ev.SensitivePlain) == 0 && e.Box != nil {
-		// token already sealed on the processor event; copy after open is handled by caller storing ciphertext on subscription in a later step
-	}
-	pe, _ := tx.GetProcessorEvent(ev.ProcessorFamily, ev.ProcessorEventID)
-	if len(pe.SensitiveCiphertext) > 0 {
-		created.PaymentMethodCiphertext = pe.SensitiveCiphertext
-		created.PaymentMethodNonce = pe.SensitiveNonce
-		created.PaymentMethodKeyVersion = pe.SensitiveKeyVersion
+	if err := e.assignStoredPaymentMethod(&created, ref, ev); err != nil {
+		return nil, err
 	}
 	if err := e.commitChange(tx, store.Subscription{}, created, protocol.EventActivated); err != nil {
 		return nil, err
@@ -603,69 +610,207 @@ func (e *Engine) applyAdyenInitial(tx store.Tx, ev adapters.NormalizedEvent, now
 	return &ref, nil
 }
 
-// QA / TODO: dead attempt lookup; store has no GetAttemptByReference, so correlation is incomplete.
+// assignStoredPaymentMethod re-encrypts a tokenized payment method onto the subscription AAD.
+func (e *Engine) assignStoredPaymentMethod(sub *store.Subscription, ref string, ev adapters.NormalizedEvent) error {
+	if e.Box == nil || len(ev.SensitivePlain) == 0 {
+		return nil
+	}
+	ct, nonce, ver, err := e.Box.Seal(ev.SensitivePlain, envelope.AAD("payment-method", ref))
+	if err != nil {
+		return err
+	}
+	sub.PaymentMethodCiphertext = ct
+	sub.PaymentMethodNonce = nonce
+	sub.PaymentMethodKeyVersion = &ver
+	return nil
+}
+
+// replaceStoredPaymentMethod updates the encrypted payment method without a consumer-visible state change.
+func (e *Engine) replaceStoredPaymentMethod(tx store.Tx, ref string, ev adapters.NormalizedEvent, now time.Time) (*string, error) {
+	if len(ev.SensitivePlain) == 0 {
+		return &ref, nil
+	}
+	sub, err := tx.GetSubscriptionForUpdate(ref)
+	if err != nil {
+		return nil, err
+	}
+	if sub.Status == protocol.StatusExpired {
+		return &ref, nil
+	}
+	if err := e.assignStoredPaymentMethod(&sub, sub.SubscriptionRef, ev); err != nil {
+		return nil, err
+	}
+	clearedBlock := sub.AutomaticChargingBlocked
+	sub.AutomaticChargingBlocked = false
+	sub.ChargingBlockReason = nil
+	sub.UpdatedAt = now
+	if err := tx.UpdateSubscription(sub); err != nil {
+		return nil, err
+	}
+	auditID, err := newUUID()
+	if err != nil {
+		return nil, err
+	}
+	meta := map[string]any{}
+	if clearedBlock {
+		meta["cleared_charging_block"] = true
+	}
+	if err := tx.InsertAudit(store.Audit{
+		AuditID:    auditID,
+		Action:     "payment-method-replaced",
+		TargetType: "subscription",
+		TargetID:   sub.SubscriptionRef,
+		Actor:      "engine",
+		Reason:     "adyen-stored-payment-method",
+		Metadata:   meta,
+	}); err != nil {
+		return nil, err
+	}
+	return &ref, nil
+}
+
+// applyAdyenRenewal correlates a renewal AUTHORISATION webhook to a stored charge attempt.
 func (e *Engine) applyAdyenRenewal(tx store.Tx, ev adapters.NormalizedEvent, now time.Time) (*string, error) {
 	attemptRef, _ := ev.Fields["attempt_reference"].(string)
 	success, _ := ev.Fields["success"].(bool)
 	if attemptRef == "" {
-		return nil, nil
+		return nil, errManualReview
 	}
-	var att store.ChargeAttempt
-	found := false
-	// lookup by scanning attempts for the action is done via GetAttempts; memory store has no index by attempt_reference
-	_ = att
-	_ = found
-	subs, err := tx.GetSubscription("")
-	_ = subs
-	_ = err
-	// Find subscription via attempt reference uniqueness in charge attempts: iterate is not on Tx.
-	// Scheduler path updates attempts; webhook correlates by attempt_reference stored on the attempt.
-	return e.applyAdyenRenewalByRef(tx, attemptRef, success, ev, now)
+	att, err := tx.GetAttemptByReference(attemptRef)
+	if err != nil {
+		return nil, errManualReview
+	}
+	switch att.Status {
+	case "authorized":
+		sub, err := tx.GetSubscription(att.SubscriptionRef)
+		if err != nil {
+			return nil, err
+		}
+		return &sub.SubscriptionRef, nil
+	case "refused", "canceled", "manual_review":
+		return &att.SubscriptionRef, nil
+	}
+	payID, _ := ev.Fields["processor_payment_id"].(string)
+	refusal, _ := ev.Fields["refusal_code"].(string)
+	att.ClaimToken = nil
+	att.LeaseUntil = nil
+	done := now
+	att.CompletedAt = &done
+	if payID != "" {
+		att.ProcessorPaymentID = store.StrPtr(payID)
+	}
+	sub, err := tx.GetSubscriptionForUpdate(att.SubscriptionRef)
+	if err != nil {
+		return nil, err
+	}
+	if success {
+		att.Status = "authorized"
+		if err := tx.UpdateAttempt(att); err != nil {
+			return nil, err
+		}
+		if err := tx.ForceFinishAction(att.ActionID, "completed", nil, nil); err != nil {
+			return nil, err
+		}
+		dec, err := Decide(sub, Observation{
+			Status:      protocol.StatusActive,
+			PeriodStart: att.PeriodStart,
+			PeriodEnd:   att.PeriodEnd,
+		}, now)
+		if err != nil {
+			return nil, err
+		}
+		if dec.Noop {
+			return &sub.SubscriptionRef, nil
+		}
+		if err := e.commitChange(tx, sub, dec.Next, dec.EventType); err != nil {
+			return nil, err
+		}
+		return &dec.Next.SubscriptionRef, nil
+	}
+	att.Status = "refused"
+	if refusal != "" {
+		att.RefusalReasonCode = store.StrPtr(refusal)
+	}
+	if err := tx.UpdateAttempt(att); err != nil {
+		return nil, err
+	}
+	dec, err := Decide(sub, Observation{Status: protocol.StatusPastDue}, now)
+	if err != nil {
+		return nil, err
+	}
+	if !dec.Noop {
+		if err := e.commitChange(tx, sub, dec.Next, dec.EventType); err != nil {
+			return nil, err
+		}
+		sub = dec.Next
+	}
+	if err := e.rescheduleOrExpireAfterRefusal(tx, att, sub, now); err != nil {
+		return nil, err
+	}
+	return &sub.SubscriptionRef, nil
 }
 
-// QA / TODO: ignores attempt_reference and correlates only by processor_payment_id.
-func (e *Engine) applyAdyenRenewalByRef(tx store.Tx, attemptRef string, success bool, ev adapters.NormalizedEvent, now time.Time) (*string, error) {
-	_ = attemptRef
-	payID, _ := ev.Fields["processor_payment_id"].(string)
-	if payID != "" {
-		sub, err := tx.GetSubscriptionByChargePayment(payID)
-		if err == nil {
-			obs := Observation{Status: protocol.StatusPastDue}
-			if success {
-				obs = Observation{
-					Status:      protocol.StatusActive,
-					PeriodStart: sub.CurrentPeriodEnd,
-					PeriodEnd:   protocol.AddCalendarMonths(sub.CurrentPeriodEnd, 1),
-				}
-			}
-			dec, err := Decide(sub, obs, now)
-			if err != nil {
-				return nil, err
-			}
-			if dec.Noop {
-				return &sub.SubscriptionRef, nil
-			}
-			if err := e.commitChange(tx, sub, dec.Next, dec.EventType); err != nil {
-				return nil, err
-			}
-			return &dec.Next.SubscriptionRef, nil
+// rescheduleOrExpireAfterRefusal continues dunning or creates the exhausted-dunning expiry action.
+func (e *Engine) rescheduleOrExpireAfterRefusal(tx store.Tx, att store.ChargeAttempt, sub store.Subscription, now time.Time) error {
+	if !retryableRefusal(att.RefusalReasonCode) || att.AttemptNumber >= len(e.Config.RenewalRetryDelays) {
+		if err := tx.ForceFinishAction(att.ActionID, "completed", nil, store.StrPtr("refused")); err != nil {
+			return err
 		}
+		delay := e.Config.DunningTermination
+		target := protocol.TruncateUTC(now.Add(delay))
+		key := protocol.ActionKey(sub.SubscriptionRef, protocol.ActionExpire, target)
+		aid, err := newUUID()
+		if err != nil {
+			return err
+		}
+		return ignoreConflict(tx.InsertAction(store.ScheduledAction{
+			ActionID:        aid,
+			ActionKey:       key,
+			SubscriptionRef: sub.SubscriptionRef,
+			ActionType:      protocol.ActionExpire,
+			TargetAt:        target,
+			DueAt:           target,
+			Status:          "pending",
+		}))
 	}
-	return nil, nil
+	due := now.Add(e.Config.RenewalRetryDelays[att.AttemptNumber-1])
+	return tx.ForceFinishAction(att.ActionID, "pending", &due, store.StrPtr("refused"))
+}
+
+// retryableRefusal reports whether a stored refusal code may be retried.
+func retryableRefusal(code *string) bool {
+	if code == nil {
+		return true
+	}
+	return IsRetryableRefusal(*code)
+}
+
+// ignoreConflict treats unique-key conflicts as already-created rows.
+func ignoreConflict(err error) error {
+	if errors.Is(err, store.ErrConflict) {
+		return nil
+	}
+	return err
 }
 
 // applyAdyenContract applies Adyen cancellation/contract-change notifications.
 func (e *Engine) applyAdyenContract(tx store.Tx, ev adapters.NormalizedEvent, now time.Time) (*string, error) {
 	payID, _ := ev.Fields["processor_payment_id"].(string)
 	if payID == "" {
-		return nil, nil
+		return nil, errManualReview
 	}
-	sub, err := tx.GetSubscriptionByInitialPayment(protocol.ProcessorAdyen, payID)
-	if errors.Is(err, store.ErrNotFound) {
-		sub, err = tx.GetSubscriptionByChargePayment(payID)
-	}
-	if err != nil {
-		return nil, nil
+	initial, errInitial := tx.GetSubscriptionByInitialPayment(protocol.ProcessorAdyen, payID)
+	charge, errCharge := tx.GetSubscriptionByChargePayment(payID)
+	var sub store.Subscription
+	switch {
+	case errInitial == nil && errCharge == nil && initial.SubscriptionRef != charge.SubscriptionRef:
+		return nil, errManualReview
+	case errInitial == nil:
+		sub = initial
+	case errCharge == nil:
+		sub = charge
+	default:
+		return nil, errManualReview
 	}
 	dec, err := Decide(sub, Observation{Status: protocol.StatusCanceled, CancelAtPeriodEnd: true}, now)
 	if err != nil {
@@ -699,6 +844,130 @@ func (e *Engine) CancelAtPeriodEnd(ctx context.Context, ref string) error {
 	})
 }
 
+// ResolveAttempt applies an audited operator resolution to an uncertain or manual-review attempt.
+func (e *Engine) ResolveAttempt(ctx context.Context, attemptID, outcome, reason, actor, paymentID string) error {
+	now := e.now()
+	if reason == "" {
+		reason = "operator"
+	}
+	if actor == "" {
+		actor = "cli"
+	}
+	return e.Store.InTx(ctx, func(tx store.Tx) error {
+		att, err := tx.GetAttempt(attemptID)
+		if err != nil {
+			return err
+		}
+		if att.Status != "uncertain" && att.Status != "manual_review" {
+			return fmt.Errorf("attempt is %s", att.Status)
+		}
+		sub, err := tx.GetSubscriptionForUpdate(att.SubscriptionRef)
+		if err != nil {
+			return err
+		}
+		auditID, err := newUUID()
+		if err != nil {
+			return err
+		}
+		if err := tx.InsertAudit(store.Audit{
+			AuditID:    auditID,
+			Action:     "resolve-attempt",
+			TargetType: "attempt",
+			TargetID:   att.AttemptID,
+			Actor:      actor,
+			Reason:     reason,
+			Metadata:   map[string]any{"outcome": outcome},
+		}); err != nil {
+			return err
+		}
+		att.ClaimToken = nil
+		att.LeaseUntil = nil
+		done := now
+		att.CompletedAt = &done
+		if paymentID != "" {
+			att.ProcessorPaymentID = store.StrPtr(paymentID)
+		}
+		switch outcome {
+		case "authorized":
+			att.Status = "authorized"
+			if err := tx.UpdateAttempt(att); err != nil {
+				return err
+			}
+			if err := tx.ForceFinishAction(att.ActionID, "completed", nil, nil); err != nil {
+				return err
+			}
+			sub.AutomaticChargingBlocked = false
+			sub.ChargingBlockReason = nil
+			dec, err := Decide(sub, Observation{
+				Status:      protocol.StatusActive,
+				PeriodStart: att.PeriodStart,
+				PeriodEnd:   att.PeriodEnd,
+			}, now)
+			if err != nil {
+				return err
+			}
+			if dec.Noop {
+				return tx.UpdateSubscription(sub)
+			}
+			return e.commitChange(tx, sub, dec.Next, dec.EventType)
+		case "refused":
+			att.Status = "refused"
+			if err := tx.UpdateAttempt(att); err != nil {
+				return err
+			}
+			dec, err := Decide(sub, Observation{Status: protocol.StatusPastDue}, now)
+			if err != nil {
+				return err
+			}
+			if !dec.Noop {
+				if err := e.commitChange(tx, sub, dec.Next, dec.EventType); err != nil {
+					return err
+				}
+				sub = dec.Next
+			}
+			return e.rescheduleOrExpireAfterRefusal(tx, att, sub, now)
+		case "expired":
+			att.Status = "canceled"
+			if err := tx.UpdateAttempt(att); err != nil {
+				return err
+			}
+			if err := tx.ForceFinishAction(att.ActionID, "canceled", nil, store.StrPtr("operator")); err != nil {
+				return err
+			}
+			dec, err := Decide(sub, Observation{Status: protocol.StatusExpired, ImmediateExpire: true}, now)
+			if err != nil {
+				return err
+			}
+			if dec.Noop {
+				return nil
+			}
+			return e.commitChange(tx, sub, dec.Next, dec.EventType)
+		default:
+			return fmt.Errorf("unknown outcome")
+		}
+	})
+}
+
+// ReplayLatest requeues the latest stored callback for a subscription.
+func (e *Engine) ReplayLatest(ctx context.Context, ref, reason, actor string) error {
+	if reason == "" {
+		reason = "mock-replay"
+	}
+	if actor == "" {
+		actor = "mock"
+	}
+	return e.Store.InTx(ctx, func(tx store.Tx) error {
+		ev, err := tx.LatestOutbound(ref)
+		if err != nil {
+			return err
+		}
+		if ev.DeliveryState == protocol.DeliveryPending {
+			return nil
+		}
+		return tx.RequeueOutbound(ev.EventID, reason, actor, tx.Now())
+	})
+}
+
 // ExpireNow applies an immediate expired transition for scheduler or mock paths.
 func (e *Engine) ExpireNow(ctx context.Context, ref string) error {
 	now := e.now()
@@ -716,6 +985,25 @@ func (e *Engine) ExpireNow(ctx context.Context, ref string) error {
 		}
 		return e.commitChange(tx, sub, dec.Next, dec.EventType)
 	})
+}
+
+// BlockAutomaticCharging sets the charging block while leaving consumer state past_due.
+func (e *Engine) BlockAutomaticCharging(tx store.Tx, sub store.Subscription, reason string, now time.Time) error {
+	if sub.Status != protocol.StatusPastDue {
+		dec, err := Decide(sub, Observation{Status: protocol.StatusPastDue}, now)
+		if err != nil {
+			return err
+		}
+		if !dec.Noop {
+			if err := e.commitChange(tx, sub, dec.Next, dec.EventType); err != nil {
+				return err
+			}
+			sub = dec.Next
+		}
+	}
+	sub.AutomaticChargingBlocked = true
+	sub.ChargingBlockReason = store.StrPtr(reason)
+	return tx.UpdateSubscription(sub)
 }
 
 // ActivateCheckout is the mock/dev path that activates without a provider webhook.

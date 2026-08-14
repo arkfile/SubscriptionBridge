@@ -304,6 +304,16 @@ Metrics should use low-cardinality labels. Never use `checkout_id`, `subscriptio
 
 Health endpoints must not disclose configuration or credentials.
 
+## TypeScript assets
+
+Compile hosted TypeScript with a Zig-based Bun (`1.2.x` or `1.3.x`, last Zig release `1.3.14`):
+
+```bash
+bun web/portal/build.ts
+```
+
+Do not use Node, npm, npx, yarn, pnpm, or a Bun 1.4+ / canary Rust rewrite. Do not add a `package.json` or `node_modules` tree for this compile step. Check the compiled `internal/httpapi/static/portal.js` into the repository so `go test` does not require Bun.
+
 ## Testing Requirements
 
 Maintain:

@@ -543,6 +543,15 @@ func (t *memTx) InsertAction(a ScheduledAction) error {
 	return nil
 }
 
+// GetAction loads a scheduled action by ID.
+func (t *memTx) GetAction(id string) (ScheduledAction, error) {
+	a, ok := t.m.actions[id]
+	if !ok {
+		return ScheduledAction{}, ErrNotFound
+	}
+	return a, nil
+}
+
 // GetActionByKey loads a scheduled action by its stable key.
 func (t *memTx) GetActionByKey(key string) (ScheduledAction, error) {
 	for _, a := range t.m.actions {
@@ -553,24 +562,53 @@ func (t *memTx) GetActionByKey(key string) (ScheduledAction, error) {
 	return ScheduledAction{}, ErrNotFound
 }
 
-// ClaimDueAction leases one due scheduled action of the requested kinds.
-func (t *memTx) ClaimDueAction(now time.Time, lease time.Duration, kinds ...string) (ScheduledAction, error) {
-	allow := map[string]bool{}
-	for _, k := range kinds {
-		allow[k] = true
+// kindAllowed reports whether actionType is in kinds, or true when kinds is empty.
+func kindAllowed(kinds []string, actionType string) bool {
+	if len(kinds) == 0 {
+		return true
 	}
-	var chosen *ScheduledAction
-	for _, a := range t.m.actions {
-		if a.Status != "pending" && a.Status != "uncertain" {
-			continue
+	for _, k := range kinds {
+		if k == actionType {
+			return true
 		}
-		if len(allow) > 0 && !allow[a.Status] && !allow[a.ActionType] {
-			continue
-		}
-		if a.DueAt.After(now) {
-			continue
+	}
+	return false
+}
+
+// actionDue reports whether a scheduled action is claimable for the requested status.
+func (t *memTx) actionDue(a ScheduledAction, now time.Time, status string) bool {
+	switch a.Status {
+	case status:
+	case "running":
+		if status != "pending" && status != "uncertain" {
+			return false
 		}
 		if a.LeaseUntil != nil && a.LeaseUntil.After(now) {
+			return false
+		}
+	default:
+		return false
+	}
+	if a.DueAt.After(now) && a.Status != "running" {
+		return false
+	}
+	if a.Status != "running" && a.LeaseUntil != nil && a.LeaseUntil.After(now) {
+		return false
+	}
+	if a.ActionType == protocol.ActionRenew {
+		sub, err := t.GetSubscription(a.SubscriptionRef)
+		if err != nil || sub.AutomaticChargingBlocked {
+			return false
+		}
+	}
+	return true
+}
+
+// LockDueAction returns one due action of the requested status and kinds without claiming it.
+func (t *memTx) LockDueAction(now time.Time, status string, kinds ...string) (ScheduledAction, error) {
+	var chosen *ScheduledAction
+	for _, a := range t.m.actions {
+		if !t.actionDue(a, now, status) || !kindAllowed(kinds, a.ActionType) {
 			continue
 		}
 		copy := a
@@ -581,11 +619,30 @@ func (t *memTx) ClaimDueAction(now time.Time, lease time.Duration, kinds ...stri
 	if chosen == nil {
 		return ScheduledAction{}, ErrNotFound
 	}
+	return *chosen, nil
+}
+
+// ClaimAction takes or reclaims ownership of a specific action and increments its fence.
+func (t *memTx) ClaimAction(actionID string, now time.Time, lease time.Duration) (ScheduledAction, error) {
+	a, ok := t.m.actions[actionID]
+	if !ok {
+		return ScheduledAction{}, ErrNotFound
+	}
+	if a.Status != "pending" && a.Status != "uncertain" {
+		if a.Status != "running" || (a.LeaseUntil != nil && a.LeaseUntil.After(now)) {
+			return ScheduledAction{}, ErrNotOwned
+		}
+	}
+	if a.ActionType == protocol.ActionRenew {
+		sub, err := t.GetSubscription(a.SubscriptionRef)
+		if err != nil || sub.AutomaticChargingBlocked {
+			return ScheduledAction{}, protocol.ErrAutomaticChargeBlocked
+		}
+	}
 	token, err := newToken()
 	if err != nil {
 		return ScheduledAction{}, err
 	}
-	a := t.m.actions[chosen.ActionID]
 	until := now.Add(lease)
 	a.Status = "running"
 	a.ClaimToken = &token
@@ -593,6 +650,15 @@ func (t *memTx) ClaimDueAction(now time.Time, lease time.Duration, kinds ...stri
 	a.LeaseUntil = &until
 	t.m.actions[a.ActionID] = a
 	return a, nil
+}
+
+// ClaimDueAction locks and claims one due scheduled action of the requested status and kinds.
+func (t *memTx) ClaimDueAction(now time.Time, lease time.Duration, status string, kinds ...string) (ScheduledAction, error) {
+	a, err := t.LockDueAction(now, status, kinds...)
+	if err != nil {
+		return ScheduledAction{}, err
+	}
+	return t.ClaimAction(a.ActionID, now, lease)
 }
 
 // FinishAction completes or reschedules a claimed action if the fence still matches.
@@ -617,10 +683,32 @@ func (t *memTx) FinishAction(actionID, claimToken string, fence int64, status st
 	return nil
 }
 
+// ForceFinishAction completes a non-terminal action without a fencing match, for webhook correlation.
+func (t *memTx) ForceFinishAction(actionID, status string, dueAt *time.Time, errClass *string) error {
+	a, ok := t.m.actions[actionID]
+	if !ok {
+		return ErrNotFound
+	}
+	switch a.Status {
+	case "pending", "running", "uncertain":
+	default:
+		return nil
+	}
+	a.Status = status
+	a.LastErrorClass = errClass
+	if dueAt != nil {
+		a.DueAt = *dueAt
+	}
+	a.ClaimToken = nil
+	a.LeaseUntil = nil
+	t.m.actions[actionID] = a
+	return nil
+}
+
 // CancelActionsForSubscription cancels pending actions except an optional keep-key.
 func (t *memTx) CancelActionsForSubscription(ref, exceptKey string) error {
 	for id, a := range t.m.actions {
-		if a.SubscriptionRef == ref && a.ActionKey != exceptKey && (a.Status == "pending" || a.Status == "running") {
+		if a.SubscriptionRef == ref && a.ActionKey != exceptKey && (a.Status == "pending" || a.Status == "uncertain") {
 			a.Status = "canceled"
 			a.ClaimToken = nil
 			a.LeaseUntil = nil
@@ -630,10 +718,31 @@ func (t *memTx) CancelActionsForSubscription(ref, exceptKey string) error {
 	return nil
 }
 
+// ListActions returns scheduled actions for operator status.
+func (t *memTx) ListActions(limit int) ([]ScheduledAction, error) {
+	out := make([]ScheduledAction, 0, len(t.m.actions))
+	for _, a := range t.m.actions {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DueAt.Before(out[j].DueAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 // InsertAttempt records a charge attempt with its encrypted canonical request.
 func (t *memTx) InsertAttempt(a ChargeAttempt) error {
 	if _, ok := t.m.attempts[a.AttemptID]; ok {
 		return ErrConflict
+	}
+	for _, existing := range t.m.attempts {
+		if existing.AttemptReference == a.AttemptReference || existing.IdempotencyKey == a.IdempotencyKey {
+			return ErrConflict
+		}
+		if existing.SubscriptionRef == a.SubscriptionRef && existing.PeriodStart.Equal(a.PeriodStart) && existing.AttemptNumber == a.AttemptNumber {
+			return ErrConflict
+		}
 	}
 	t.m.attempts[a.AttemptID] = a
 	return nil
@@ -648,6 +757,16 @@ func (t *memTx) GetAttempt(id string) (ChargeAttempt, error) {
 	return a, nil
 }
 
+// GetAttemptByReference loads a charge attempt by its stable Adyen reference.
+func (t *memTx) GetAttemptByReference(ref string) (ChargeAttempt, error) {
+	for _, a := range t.m.attempts {
+		if a.AttemptReference == ref {
+			return a, nil
+		}
+	}
+	return ChargeAttempt{}, ErrNotFound
+}
+
 // GetAttemptsForAction lists charge attempts for a scheduled action.
 func (t *memTx) GetAttemptsForAction(actionID string) ([]ChargeAttempt, error) {
 	var out []ChargeAttempt
@@ -657,6 +776,26 @@ func (t *memTx) GetAttemptsForAction(actionID string) ([]ChargeAttempt, error) {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return aNum(out[i]) < aNum(out[j]) })
+	return out, nil
+}
+
+// ListAttempts returns charge attempts matching the given statuses.
+func (t *memTx) ListAttempts(statuses []string, limit int) ([]ChargeAttempt, error) {
+	allow := map[string]bool{}
+	for _, s := range statuses {
+		allow[s] = true
+	}
+	var out []ChargeAttempt
+	for _, a := range t.m.attempts {
+		if len(allow) > 0 && !allow[a.Status] {
+			continue
+		}
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return aNum(out[i]) < aNum(out[j]) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
 	return out, nil
 }
 
@@ -673,20 +812,19 @@ func (t *memTx) UpdateAttempt(a ChargeAttempt) error {
 }
 
 // ClaimAttemptWithAction re-validates action ownership before mutating an attempt.
-func (t *memTx) ClaimAttemptWithAction(actionID, attemptID, claimToken string, fence int64, now time.Time, lease time.Duration) (ScheduledAction, ChargeAttempt, error) {
+func (t *memTx) ClaimAttemptWithAction(actionID, attemptID, claimToken string, fence int64, now time.Time, lease time.Duration, resolutionDeadline time.Time) (ScheduledAction, ChargeAttempt, error) {
 	a, ok := t.m.actions[actionID]
 	if !ok {
 		return ScheduledAction{}, ChargeAttempt{}, ErrNotFound
+	}
+	if a.Status != "running" || a.ClaimToken == nil || *a.ClaimToken != claimToken || a.FencingToken != fence {
+		return ScheduledAction{}, ChargeAttempt{}, ErrNotOwned
 	}
 	att, ok := t.m.attempts[attemptID]
 	if !ok {
 		return ScheduledAction{}, ChargeAttempt{}, ErrNotFound
 	}
 	until := now.Add(lease)
-	a.Status = "running"
-	a.ClaimToken = &claimToken
-	a.FencingToken = fence
-	a.LeaseUntil = &until
 	att.Status = "running"
 	att.ClaimToken = &claimToken
 	att.FencingToken = fence
@@ -694,12 +832,45 @@ func (t *memTx) ClaimAttemptWithAction(actionID, attemptID, claimToken string, f
 	if att.FirstSubmittedAt == nil {
 		n := protocol.TruncateUTC(now)
 		att.FirstSubmittedAt = &n
-		dl := n.Add(6 * 24 * time.Hour)
+		dl := protocol.TruncateUTC(resolutionDeadline)
+		if dl.IsZero() {
+			dl = n.Add(6 * 24 * time.Hour)
+		}
 		att.ResolutionDeadline = &dl
 	}
-	t.m.actions[actionID] = a
 	t.m.attempts[attemptID] = att
 	return a, att, nil
+}
+
+// ListSubscriptions returns subscriptions for operator reconcile.
+func (t *memTx) ListSubscriptions(limit int) ([]Subscription, error) {
+	out := make([]Subscription, 0, len(t.m.subs))
+	for _, s := range t.m.subs {
+		out = append(out, s)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// LatestOutbound returns the highest state_version outbound event for a subscription.
+func (t *memTx) LatestOutbound(subscriptionRef string) (OutboundEvent, error) {
+	var best OutboundEvent
+	found := false
+	for _, e := range t.m.outbound {
+		if e.SubscriptionRef != subscriptionRef {
+			continue
+		}
+		if !found || e.StateVersion > best.StateVersion {
+			best = e
+			found = true
+		}
+	}
+	if !found {
+		return OutboundEvent{}, ErrNotFound
+	}
+	return best, nil
 }
 
 // InsertAudit appends an operator audit row.

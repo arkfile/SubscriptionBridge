@@ -42,12 +42,12 @@ func (a *Adapter) Family() string { return protocol.ProcessorStripe }
 // CreateCheckout creates a Stripe Checkout Session with a stable idempotency key.
 func (a *Adapter) CreateCheckout(ctx context.Context, request adapters.CheckoutRequest) (adapters.CheckoutResult, error) {
 	form := map[string]string{
-		"mode":                              "subscription",
-		"success_url":                       request.ReturnURL,
-		"cancel_url":                        request.ReturnURL,
-		"line_items[0][price]":              request.StripePriceID,
-		"line_items[0][quantity]":           "1",
-		"metadata[checkout_id]":             request.CheckoutID,
+		"mode":                    "subscription",
+		"success_url":             request.ReturnURL,
+		"cancel_url":              request.ReturnURL,
+		"line_items[0][price]":    request.StripePriceID,
+		"line_items[0][quantity]": "1",
+		"metadata[checkout_id]":   request.CheckoutID,
 		"subscription_data[metadata][checkout_id]": request.CheckoutID,
 	}
 	if !request.ExpiresAt.IsZero() {
@@ -73,6 +73,11 @@ func (a *Adapter) CreatePortalSession(ctx context.Context, processorCustomerID, 
 		"return_url": returnURL,
 	}, &out)
 	return out.URL, err
+}
+
+// CreatePaymentUpdateSession is Stripe Billing Portal's responsibility; Drop-in is Adyen-only.
+func (a *Adapter) CreatePaymentUpdateSession(context.Context, adapters.PaymentUpdateRequest) (adapters.PaymentUpdateSession, error) {
+	return adapters.PaymentUpdateSession{}, adapters.ErrProviderManaged
 }
 
 // ParseWebhook verifies the Stripe signature and normalizes event kinds.

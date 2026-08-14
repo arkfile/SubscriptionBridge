@@ -57,16 +57,16 @@ func (a *Adapter) PaymentsURL() string { return a.CheckoutEndpoint() + "/payment
 // CreateCheckout creates an Adyen hosted checkout session with a bridge shopper reference.
 func (a *Adapter) CreateCheckout(ctx context.Context, request adapters.CheckoutRequest) (adapters.CheckoutResult, error) {
 	payload := map[string]any{
-		"merchantAccount":         request.MerchantAccount,
-		"amount":                  map[string]any{"value": request.AmountMinor, "currency": request.Currency},
-		"reference":               request.CheckoutID,
-		"returnUrl":               request.ReturnURL,
-		"countryCode":             request.CountryCode,
-		"shopperReference":        request.ShopperRef,
-		"storePaymentMethod":      true,
-		"shopperInteraction":      "Ecommerce",
+		"merchantAccount":          request.MerchantAccount,
+		"amount":                   map[string]any{"value": request.AmountMinor, "currency": request.Currency},
+		"reference":                request.CheckoutID,
+		"returnUrl":                request.ReturnURL,
+		"countryCode":              request.CountryCode,
+		"shopperReference":         request.ShopperRef,
+		"storePaymentMethod":       true,
+		"shopperInteraction":       "Ecommerce",
 		"recurringProcessingModel": "Subscription",
-		"metadata":                map[string]string{"checkout_id": request.CheckoutID},
+		"metadata":                 map[string]string{"checkout_id": request.CheckoutID},
 	}
 	var out struct {
 		ID  string `json:"id"`
@@ -82,7 +82,34 @@ func (a *Adapter) CreateCheckout(ctx context.Context, request adapters.CheckoutR
 	return adapters.CheckoutResult{RedirectURL: redirect, ProcessorCheckoutID: out.ID, ExpiresAt: request.ExpiresAt}, nil
 }
 
-// QA / TODO: Adyen portal is locally hosted; this echoes returnURL and is not a provider portal.
+// CreatePaymentUpdateSession creates a Checkout Session for Drop-in on the existing shopper.
+func (a *Adapter) CreatePaymentUpdateSession(ctx context.Context, request adapters.PaymentUpdateRequest) (adapters.PaymentUpdateSession, error) {
+	payload := map[string]any{
+		"merchantAccount":          request.MerchantAccount,
+		"amount":                   map[string]any{"value": request.AmountMinor, "currency": request.Currency},
+		"reference":                request.IdempotencyKey,
+		"returnUrl":                request.ReturnURL,
+		"countryCode":              request.CountryCode,
+		"shopperReference":         request.ShopperRef,
+		"storePaymentMethod":       true,
+		"shopperInteraction":       "Ecommerce",
+		"recurringProcessingModel": "Subscription",
+		"metadata":                 map[string]string{"checkout_id": request.CheckoutID},
+	}
+	var out struct {
+		ID          string `json:"id"`
+		SessionData string `json:"sessionData"`
+	}
+	if err := a.postJSON(ctx, a.CheckoutEndpoint()+"/sessions", request.IdempotencyKey, payload, &out); err != nil {
+		return adapters.PaymentUpdateSession{}, err
+	}
+	if out.ID == "" || out.SessionData == "" {
+		return adapters.PaymentUpdateSession{}, fmt.Errorf("adyen session incomplete")
+	}
+	return adapters.PaymentUpdateSession{ID: out.ID, SessionData: out.SessionData}, nil
+}
+
+// CreatePortalSession is unused for Adyen; the bridge hosts the portal locally.
 func (a *Adapter) CreatePortalSession(_ context.Context, _, returnURL string) (string, error) {
 	return returnURL, nil
 }
@@ -112,6 +139,7 @@ func (a *Adapter) ParseWebhook(_ context.Context, _ http.Header, body []byte) ([
 		psp, _ := item["pspReference"].(string)
 		orig, _ := item["originalReference"].(string)
 		merchantRef, _ := item["merchantReference"].(string)
+		add, _ := item["additionalData"].(map[string]any)
 		id := strings.Join([]string{psp, eventCode, stringify(item["success"]), orig}, ":")
 		fields := map[string]any{
 			"processor_payment_id": psp,
@@ -132,8 +160,8 @@ func (a *Adapter) ParseWebhook(_ context.Context, _ http.Header, body []byte) ([
 				}
 			} else {
 				kind = adapters.KindAdyenInitialAuthorisation
-				if strings.HasPrefix(merchantRef, protocol.CheckoutPrefix) {
-					fields["checkout_id"] = merchantRef
+				if checkoutID := checkoutIDFromNotification(merchantRef, add); checkoutID != "" {
+					fields["checkout_id"] = checkoutID
 				}
 			}
 		case "CANCELLATION", "CANCEL_OR_REFUND":
@@ -152,17 +180,49 @@ func (a *Adapter) ParseWebhook(_ context.Context, _ http.Header, body []byte) ([
 			Fields:            fields,
 		}
 		if success && eventCode == "AUTHORISATION" && kind == adapters.KindAdyenInitialAuthorisation {
-			if add, ok := item["additionalData"].(map[string]any); ok {
-				if tok := stringify(add["recurring.recurringDetailReference"]); tok != "" {
-					n.SensitivePlain = []byte(tok)
-				} else if tok := stringify(add["tokenization.storedPaymentMethodId"]); tok != "" {
-					n.SensitivePlain = []byte(tok)
-				}
+			if tok := storedPaymentMethodID(add); tok != "" {
+				n.SensitivePlain = []byte(tok)
 			}
 		}
 		out = append(out, n)
 	}
 	return out, nil
+}
+
+// checkoutIDFromNotification prefers echoed checkout metadata over a unique merchant reference.
+func checkoutIDFromNotification(merchantRef string, add map[string]any) string {
+	if id := additionalString(add, "metadata.checkout_id"); protocol.ValidateCheckoutID(id) == nil {
+		return id
+	}
+	if add != nil {
+		if md, ok := add["metadata"].(map[string]any); ok {
+			if id := stringify(md["checkout_id"]); protocol.ValidateCheckoutID(id) == nil {
+				return id
+			}
+		}
+	}
+	if protocol.ValidateCheckoutID(merchantRef) == nil {
+		return merchantRef
+	}
+	return ""
+}
+
+// storedPaymentMethodID extracts a tokenized payment-method reference from additionalData.
+func storedPaymentMethodID(add map[string]any) string {
+	return additionalString(add, "recurring.recurringDetailReference", "tokenization.storedPaymentMethodId")
+}
+
+// additionalString returns the first nonempty additionalData string for keys.
+func additionalString(add map[string]any, keys ...string) string {
+	if add == nil {
+		return ""
+	}
+	for _, k := range keys {
+		if s := stringify(add[k]); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // stringify renders Adyen JSON scalars for HMAC payload construction.
@@ -219,12 +279,12 @@ func verifyAdyenItem(item map[string]any, hmacKeyHex string) error {
 	return nil
 }
 
-// QA / TODO: stub; Adyen has no provider-owned subscription object to retrieve.
+// GetSubscription returns nil because Adyen does not own a subscription object.
 func (a *Adapter) GetSubscription(context.Context, adapters.ProcessorSubscription) (*adapters.SubscriptionState, error) {
 	return nil, nil
 }
 
-// QA / TODO: stub; cancel is recorded locally and does not call Adyen.
+// CancelSubscription is a no-op; Adyen cancellation is recorded locally by the engine.
 func (a *Adapter) CancelSubscription(context.Context, adapters.ProcessorSubscription, bool) error {
 	return nil
 }
@@ -292,8 +352,8 @@ func (a *Adapter) sendExact(ctx context.Context, endpoint, idemp string, body []
 		return adapters.RenewalResult{Uncertain: true}, fmt.Errorf("adyen http %d", resp.StatusCode)
 	}
 	var parsed struct {
-		PspReference string `json:"pspReference"`
-		ResultCode   string `json:"resultCode"`
+		PspReference      string `json:"pspReference"`
+		ResultCode        string `json:"resultCode"`
 		RefusalReasonCode string `json:"refusalReasonCode"`
 	}
 	_ = json.Unmarshal(raw, &parsed)

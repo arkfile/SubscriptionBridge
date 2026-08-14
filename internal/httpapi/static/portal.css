@@ -1,0 +1,135 @@
+:root {
+    --depth-1: #060d1a;
+    --depth-2: #0a1628;
+    --depth-3: #112240;
+    --depth-4: #1e3a5f;
+    --current-1: #2d6a9f;
+    --current-2: #4a9fd4;
+    --foam-1: #cce7ff;
+    --foam-2: #8ab8d8;
+    --biolum: #00d4aa;
+    --phosphor: #f0a500;
+    --coral: #e05c5c;
+    --salt: #ffffff;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    min-height: 100vh;
+    background-color: var(--depth-1);
+    color: var(--foam-1);
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    line-height: 1.5;
+}
+
+.portal-card {
+    max-width: 36rem;
+    margin: 2.5rem auto;
+    padding: 2rem;
+    background-color: var(--depth-3);
+    border: 1px solid var(--depth-4);
+    border-radius: 8px;
+}
+
+h1 {
+    margin: 0 0 1.5rem;
+    color: var(--salt);
+    font-size: 1.35rem;
+    font-weight: 600;
+}
+
+.billing-panel-section {
+    margin-bottom: 1.25rem;
+}
+
+.billing-panel-section:last-of-type {
+    margin-bottom: 0;
+}
+
+.billing-panel-section h4 {
+    margin: 0 0 0.4rem;
+    font-size: 0.78rem;
+    color: var(--foam-2);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+}
+
+#dropin {
+    margin: 0.75rem 0 1.25rem;
+    padding: 0;
+}
+
+.portal-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+}
+
+.btn-secondary,
+.danger-button {
+    padding: 0.75rem 1.5rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 1rem;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+.btn-secondary {
+    background-color: var(--depth-3);
+    color: var(--salt);
+    border: 2px solid var(--depth-4);
+}
+
+.btn-secondary:hover {
+    background-color: var(--depth-2);
+    border-color: var(--current-2);
+}
+
+.danger-button {
+    background-color: var(--coral);
+    color: var(--salt);
+    border: none;
+}
+
+.danger-button:hover {
+    background-color: color-mix(in srgb, var(--coral) 80%, var(--depth-1));
+}
+
+a {
+    color: var(--current-2);
+    text-decoration: none;
+}
+
+a:hover {
+    color: var(--salt);
+}
+
+.return-link {
+    display: inline-block;
+    margin-top: 1.5rem;
+}
+
+.status-ok,
+.status-err {
+    margin: 0.5rem 0 0;
+    font-size: 0.95rem;
+}
+
+.status-ok {
+    color: var(--biolum);
+}
+
+.status-err {
+    color: var(--coral);
+}

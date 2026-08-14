@@ -51,7 +51,7 @@ func main() {
 		},
 		Log: slog.New(slog.NewTextHandler(os.Stdout, nil)),
 	}
-	api := &httpapi.Server{Engine: eng, Store: mem, Keys: keys, Health: func() error { return nil }}
+	api := &httpapi.Server{Engine: eng, Store: mem, Keys: keys, Health: func() error { return nil }, EnableMock: true}
 	n := &notify.Notifier{Store: mem, Keys: keys, WebhookURL: cfg.ConsumerWebhookURL}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

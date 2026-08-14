@@ -18,6 +18,7 @@ const (
 	EventPrefix         = "evt_"
 	ShopperPrefix       = "sbr_"
 	AttemptPrefix       = "sba_"
+	PaymentUpdatePrefix = "sbpm_"
 	ActionKeyPrefix     = "act_"
 	MaxIdentifierLength = 160
 	MaxPlanIDBytes      = 128

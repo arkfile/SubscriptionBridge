@@ -55,6 +55,11 @@ func NewAttemptReference() (string, error) {
 	return NewOpaqueID(AttemptPrefix)
 }
 
+// NewPaymentUpdateReference allocates an Adyen merchant reference for a portal payment-method update.
+func NewPaymentUpdateReference() (string, error) {
+	return NewOpaqueID(PaymentUpdatePrefix)
+}
+
 // RandomClaimToken returns a UUID-shaped random claim token.
 func RandomClaimToken() ([16]byte, error) {
 	var b [16]byte

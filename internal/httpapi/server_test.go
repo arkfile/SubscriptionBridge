@@ -53,4 +53,10 @@ func TestHealthAndStart(t *testing.T) {
 	if loc := w.Header().Get("Location"); loc == "" {
 		t.Fatal("missing redirect")
 	}
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/mock/activate", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("production mux must not expose mock routes: %d", w.Code)
+	}
 }

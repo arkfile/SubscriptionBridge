@@ -14,29 +14,30 @@ import (
 )
 
 type Config struct {
-	PublicURL              string
-	ConsumerWebhookURL     string
-	PairingRoot            string
-	DefaultProcessor       string
-	StripeSecretKey        string
-	StripeWebhookSecret    string
-	AdyenAPIKey            string
-	AdyenHMACKey           string
-	AdyenLivePrefix        string
-	AdyenEnvironment       string
-	AdyenDataEncryptionKey string
-	Listen                 string
-	DatabaseURL            string
-	LogLevel               string
-	SchedulerEnabled       bool
-	RenewalRetryDelays     []time.Duration
-	DunningTermination     time.Duration
+	PublicURL               string
+	ConsumerWebhookURL      string
+	PairingRoot             string
+	DefaultProcessor        string
+	StripeSecretKey         string
+	StripeWebhookSecret     string
+	AdyenAPIKey             string
+	AdyenHMACKey            string
+	AdyenClientKey          string
+	AdyenLivePrefix         string
+	AdyenEnvironment        string
+	AdyenDataEncryptionKey  string
+	Listen                  string
+	DatabaseURL             string
+	LogLevel                string
+	SchedulerEnabled        bool
+	RenewalRetryDelays      []time.Duration
+	DunningTermination      time.Duration
 	AdyenResolutionDeadline time.Duration
-	QuarantineEnabled      bool
-	QuarantineMaxRetention time.Duration
-	PlansPath              string
-	Catalog                Catalog
-	DevMode                bool
+	QuarantineEnabled       bool
+	QuarantineMaxRetention  time.Duration
+	PlansPath               string
+	Catalog                 Catalog
+	DevMode                 bool
 }
 
 type Catalog struct {
@@ -70,23 +71,24 @@ type fileCatalog struct {
 // Load reads bridge configuration from environment variables.
 func Load() (Config, error) {
 	cfg := Config{
-		PublicURL:               strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")),
-		ConsumerWebhookURL:      strings.TrimSpace(os.Getenv("CONSUMER_WEBHOOK_URL")),
-		PairingRoot:             strings.TrimSpace(os.Getenv("BRIDGE_CONSUMER_PAIRING_ROOT")),
-		DefaultProcessor:        strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_PROCESSOR")),
-		StripeSecretKey:         strings.TrimSpace(os.Getenv("STRIPE_SECRET_KEY")),
-		StripeWebhookSecret:     strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
-		AdyenAPIKey:             strings.TrimSpace(os.Getenv("ADYEN_API_KEY")),
-		AdyenHMACKey:            strings.TrimSpace(os.Getenv("ADYEN_HMAC_KEY")),
-		AdyenLivePrefix:         strings.TrimSpace(os.Getenv("ADYEN_LIVE_PREFIX")),
-		AdyenEnvironment:        getenv("ADYEN_ENVIRONMENT", "test"),
-		AdyenDataEncryptionKey:  strings.TrimSpace(os.Getenv("ADYEN_DATA_ENCRYPTION_KEY")),
-		Listen:                  getenv("BRIDGE_LISTEN", "127.0.0.1:8081"),
-		DatabaseURL:             strings.TrimSpace(os.Getenv("BRIDGE_DATABASE_URL")),
-		LogLevel:                getenv("BRIDGE_LOG_LEVEL", "info"),
-		SchedulerEnabled:        getenv("BRIDGE_SCHEDULER_ENABLED", "true") != "false",
-		QuarantineEnabled:       getenv("BRIDGE_PROVIDER_PAYLOAD_QUARANTINE_ENABLED", "false") == "true",
-		PlansPath:               getenv("BRIDGE_PLANS_PATH", "config/plans.yaml"),
+		PublicURL:              strings.TrimSpace(os.Getenv("BRIDGE_PUBLIC_URL")),
+		ConsumerWebhookURL:     strings.TrimSpace(os.Getenv("CONSUMER_WEBHOOK_URL")),
+		PairingRoot:            strings.TrimSpace(os.Getenv("BRIDGE_CONSUMER_PAIRING_ROOT")),
+		DefaultProcessor:       strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_PROCESSOR")),
+		StripeSecretKey:        strings.TrimSpace(os.Getenv("STRIPE_SECRET_KEY")),
+		StripeWebhookSecret:    strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
+		AdyenAPIKey:            strings.TrimSpace(os.Getenv("ADYEN_API_KEY")),
+		AdyenHMACKey:           strings.TrimSpace(os.Getenv("ADYEN_HMAC_KEY")),
+		AdyenClientKey:         strings.TrimSpace(os.Getenv("ADYEN_CLIENT_KEY")),
+		AdyenLivePrefix:        strings.TrimSpace(os.Getenv("ADYEN_LIVE_PREFIX")),
+		AdyenEnvironment:       getenv("ADYEN_ENVIRONMENT", "test"),
+		AdyenDataEncryptionKey: strings.TrimSpace(os.Getenv("ADYEN_DATA_ENCRYPTION_KEY")),
+		Listen:                 getenv("BRIDGE_LISTEN", "127.0.0.1:8081"),
+		DatabaseURL:            strings.TrimSpace(os.Getenv("BRIDGE_DATABASE_URL")),
+		LogLevel:               getenv("BRIDGE_LOG_LEVEL", "info"),
+		SchedulerEnabled:       getenv("BRIDGE_SCHEDULER_ENABLED", "true") != "false",
+		QuarantineEnabled:      getenv("BRIDGE_PROVIDER_PAYLOAD_QUARANTINE_ENABLED", "false") == "true",
+		PlansPath:              getenv("BRIDGE_PLANS_PATH", "config/plans.yaml"),
 	}
 	var err error
 	cfg.RenewalRetryDelays, err = parseDurations(getenv("BRIDGE_RENEWAL_RETRY_DELAYS", "24h,72h,120h"))
@@ -210,8 +212,8 @@ func (c Config) ValidatePlans() error {
 		}
 	}
 	if selected[protocol.ProcessorAdyen] {
-		if c.AdyenAPIKey == "" || c.AdyenHMACKey == "" || c.AdyenDataEncryptionKey == "" {
-			return fmt.Errorf("adyen credentials and data-encryption key are required for configured adyen plans")
+		if c.AdyenAPIKey == "" || c.AdyenHMACKey == "" || c.AdyenClientKey == "" || c.AdyenDataEncryptionKey == "" {
+			return fmt.Errorf("adyen credentials, client key, and data-encryption key are required for configured adyen plans")
 		}
 		if c.AdyenEnvironment != "test" && c.AdyenEnvironment != "live" {
 			return fmt.Errorf("ADYEN_ENVIRONMENT must be test or live")

@@ -88,7 +88,7 @@ Stripe owns the subscription schedule. The adapter uses Stripe Checkout in subsc
 
 Subscription Bridge owns the recurring schedule. The adapter uses Adyen Checkout for initial payment and tokenization, stores the resulting payment-method reference in encrypted form, and performs recurring charges through Adyen using stable idempotency keys.
 
-The Adyen implementation includes renewal scheduling, leasing, retry and dunning policy, payment-method replacement, cancellation, and a bridge-hosted portal.
+The Adyen implementation includes renewal scheduling, leasing, retry and dunning policy, Drop-in payment-method replacement on the bridge-hosted portal, and cancellation.
 
 Both adapters must pass the same provider conformance suite.
 

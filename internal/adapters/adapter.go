@@ -15,6 +15,7 @@ type ProcessorAdapter interface {
 	Family() string
 	CreateCheckout(ctx context.Context, request CheckoutRequest) (CheckoutResult, error)
 	CreatePortalSession(ctx context.Context, processorCustomerID, returnURL string) (string, error)
+	CreatePaymentUpdateSession(ctx context.Context, request PaymentUpdateRequest) (PaymentUpdateSession, error)
 	ParseWebhook(ctx context.Context, headers http.Header, body []byte) ([]NormalizedEvent, error)
 	GetSubscription(ctx context.Context, subscription ProcessorSubscription) (*SubscriptionState, error)
 	CancelSubscription(ctx context.Context, subscription ProcessorSubscription, atPeriodEnd bool) error
@@ -39,11 +40,27 @@ type CheckoutRequest struct {
 }
 
 type CheckoutResult struct {
-	RedirectURL          string
-	ProcessorCheckoutID  string
-	ProcessorCustomerID  string
-	ExpiresAt            time.Time
-	Uncertain            bool
+	RedirectURL         string
+	ProcessorCheckoutID string
+	ProcessorCustomerID string
+	ExpiresAt           time.Time
+	Uncertain           bool
+}
+
+type PaymentUpdateRequest struct {
+	CheckoutID      string
+	ShopperRef      string
+	ReturnURL       string
+	IdempotencyKey  string
+	AmountMinor     int64
+	Currency        string
+	MerchantAccount string
+	CountryCode     string
+}
+
+type PaymentUpdateSession struct {
+	ID          string
+	SessionData string
 }
 
 type ProcessorSubscription struct {
@@ -100,10 +117,10 @@ type RenewalRequest struct {
 }
 
 type RenewalResult struct {
-	Status            string
+	Status             string
 	ProcessorPaymentID string
-	RefusalCode       string
-	Uncertain         bool
+	RefusalCode        string
+	Uncertain          bool
 }
 
 type RenewalAttempt struct {

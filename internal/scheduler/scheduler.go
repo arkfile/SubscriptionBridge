@@ -35,12 +35,15 @@ func (s *Scheduler) now() time.Time {
 	return s.Store.Now()
 }
 
-// QA / TODO: expire and renew only; no uncertain exact-replay, manual_review block, or exhausted-dunning expiry.
+// RunOnce claims due expire, renew, and uncertain-resolution work.
 func (s *Scheduler) RunOnce(ctx context.Context) error {
 	if err := s.runExpire(ctx); err != nil {
 		return err
 	}
-	return s.runRenew(ctx)
+	if err := s.runRenew(ctx); err != nil {
+		return err
+	}
+	return s.runUncertain(ctx)
 }
 
 // Loop runs due expire and renew actions until ctx is cancelled.
@@ -64,16 +67,12 @@ func (s *Scheduler) Loop(ctx context.Context, interval time.Duration) {
 func (s *Scheduler) runExpire(ctx context.Context) error {
 	now := s.now()
 	return s.Store.InTx(ctx, func(tx store.Tx) error {
-		action, err := tx.ClaimDueAction(now, s.lease(), "expire")
+		action, err := tx.ClaimDueAction(now, s.lease(), "pending", protocol.ActionExpire)
 		if errors.Is(err, store.ErrNotFound) {
 			return nil
 		}
 		if err != nil {
 			return err
-		}
-		if action.ActionType != protocol.ActionExpire {
-			st := "pending"
-			return tx.FinishAction(action.ActionID, *action.ClaimToken, action.FencingToken, st, nil, nil)
 		}
 		sub, err := tx.GetSubscriptionForUpdate(action.SubscriptionRef)
 		if err != nil {
@@ -90,152 +89,252 @@ func (s *Scheduler) runExpire(ctx context.Context) error {
 	})
 }
 
-// runRenew claims a due Adyen renew action and charges it.
+// runRenew prepares a pending Adyen renew action and charges it.
 func (s *Scheduler) runRenew(ctx context.Context) error {
 	var action store.ScheduledAction
+	var attempt store.ChargeAttempt
 	err := s.Store.InTx(ctx, func(tx store.Tx) error {
 		var err error
-		action, err = tx.ClaimDueAction(tx.Now(), s.lease(), "renew")
+		action, err = tx.LockDueAction(tx.Now(), "pending", protocol.ActionRenew)
+		if err != nil {
+			return err
+		}
+		attempt, err = s.ensurePrepared(tx, action)
 		return err
 	})
-	if errors.Is(err, store.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, protocol.ErrAutomaticChargeBlocked) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if action.ActionType != protocol.ActionRenew {
-		return nil
-	}
-	return s.charge(ctx, action)
+	return s.submit(ctx, action, attempt, false)
 }
 
-// charge persists the canonical request, calls Adyen, and records attempt outcome.
-func (s *Scheduler) charge(ctx context.Context, action store.ScheduledAction) error {
+// runUncertain exact-replays an uncertain attempt or moves it to manual_review at deadline.
+func (s *Scheduler) runUncertain(ctx context.Context) error {
+	now := s.now()
+	var action store.ScheduledAction
 	var attempt store.ChargeAttempt
+	terminal := false
 	err := s.Store.InTx(ctx, func(tx store.Tx) error {
-		sub, err := tx.GetSubscriptionForUpdate(action.SubscriptionRef)
+		var err error
+		action, err = tx.LockDueAction(now, "uncertain", protocol.ActionRenew)
 		if err != nil {
 			return err
-		}
-		if sub.AutomaticChargingBlocked {
-			return protocol.ErrAutomaticChargeBlocked
 		}
 		attempts, err := tx.GetAttemptsForAction(action.ActionID)
 		if err != nil {
 			return err
 		}
-		nextNum := len(attempts) + 1
+		found := false
 		for _, a := range attempts {
-			if a.Status == "prepared" || a.Status == "uncertain" || a.Status == "running" {
+			if a.Status == "uncertain" || a.Status == "running" {
 				attempt = a
-				return nil
-			}
-			if a.AttemptNumber >= nextNum {
-				nextNum = a.AttemptNumber + 1
+				found = true
+				break
 			}
 		}
-		plan, _, err := s.Config.ResolvePlan(sub.PlanID)
-		if err != nil {
-			return err
+		if !found {
+			return store.ErrNotFound
 		}
-		token := ""
-		if s.Box != nil && len(sub.PaymentMethodCiphertext) > 0 && sub.PaymentMethodKeyVersion != nil {
-			plain, err := s.Box.Open(sub.PaymentMethodCiphertext, sub.PaymentMethodNonce, envelope.AAD("payment-method", sub.SubscriptionRef), *sub.PaymentMethodKeyVersion)
+		if attempt.ResolutionDeadline != nil && !attempt.ResolutionDeadline.After(now) {
+			attempt.Status = "manual_review"
+			attempt.ClaimToken = nil
+			attempt.LeaseUntil = nil
+			if err := tx.UpdateAttempt(attempt); err != nil {
+				return err
+			}
+			if err := tx.ForceFinishAction(action.ActionID, "manual_review", nil, store.StrPtr("resolution_deadline")); err != nil {
+				return err
+			}
+			sub, err := tx.GetSubscriptionForUpdate(action.SubscriptionRef)
 			if err != nil {
 				return err
 			}
-			token = string(plain)
+			terminal = true
+			return s.Engine.BlockAutomaticCharging(tx, sub, "resolution_deadline", now)
 		}
-		ref, err := protocol.NewAttemptReference()
-		if err != nil {
-			return err
-		}
-		idemp := "sb_charge_" + ref
-		shopper := ""
-		if sub.ProcessorShopperReference != nil {
-			shopper = *sub.ProcessorShopperReference
-		}
-		body := adyenadapter.CanonicalPaymentBody(plan.Adyen.MerchantAccount, plan.Currency, ref, shopper, token, plan.AmountMinor)
-		fp := sha256.Sum256(body)
-		var ct, nonce []byte
-		ver := envelope.VersionV1
-		if s.Box != nil {
-			ct, nonce, ver, err = s.Box.Seal(body, envelope.AAD("charge-request", ref))
-			if err != nil {
-				return err
-			}
-		}
-		aid, err := newID()
-		if err != nil {
-			return err
-		}
-		endpoint := ""
-		if ad, ok := s.Adyen.(*adyenadapter.Adapter); ok {
-			endpoint = ad.PaymentsURL()
-		}
-		attempt = store.ChargeAttempt{
-			AttemptID:                aid,
-			ActionID:                 action.ActionID,
-			SubscriptionRef:          sub.SubscriptionRef,
-			PeriodStart:              sub.CurrentPeriodEnd,
-			PeriodEnd:                protocol.AddCalendarMonths(sub.CurrentPeriodEnd, 1),
-			AttemptNumber:            nextNum,
-			ProviderEndpoint:         endpoint,
-			ProviderAPIVersion:       adyenadapter.APIVersion,
-			MerchantAccount:          plan.Adyen.MerchantAccount,
-			AmountMinor:              plan.AmountMinor,
-			Currency:                 plan.Currency,
-			AttemptReference:         ref,
-			ShopperReference:         shopper,
-			ShopperInteraction:       "ContAuth",
-			RecurringProcessingModel: "Subscription",
-			IdempotencyKey:           idemp,
-			RequestFingerprint:       fp[:],
-			RequestCiphertext:        ct,
-			RequestNonce:             nonce,
-			RequestKeyVersion:        ver,
-			Status:                   "prepared",
-		}
-		return tx.InsertAttempt(attempt)
+		return nil
 	})
-	if err != nil {
-		return err
-	}
-	now := s.now()
-	if action.ClaimToken == nil {
+	if errors.Is(err, store.ErrNotFound) {
 		return nil
 	}
-	claim := *action.ClaimToken
-	fence := action.FencingToken
-	err = s.Store.InTx(ctx, func(tx store.Tx) error {
-		var err error
-		action, attempt, err = tx.ClaimAttemptWithAction(action.ActionID, attempt.AttemptID, claim, fence, now, s.lease())
+	if err != nil || terminal {
+		return err
+	}
+	return s.submit(ctx, action, attempt, true)
+}
+
+// ensurePrepared returns the open attempt for an action or inserts the next prepared row.
+func (s *Scheduler) ensurePrepared(tx store.Tx, action store.ScheduledAction) (store.ChargeAttempt, error) {
+	sub, err := tx.GetSubscriptionForUpdate(action.SubscriptionRef)
+	if err != nil {
+		return store.ChargeAttempt{}, err
+	}
+	if sub.AutomaticChargingBlocked {
+		return store.ChargeAttempt{}, protocol.ErrAutomaticChargeBlocked
+	}
+	attempts, err := tx.GetAttemptsForAction(action.ActionID)
+	if err != nil {
+		return store.ChargeAttempt{}, err
+	}
+	nextNum := 1
+	for _, a := range attempts {
+		if a.Status == "prepared" || a.Status == "uncertain" || a.Status == "running" {
+			return a, nil
+		}
+		if a.AttemptNumber >= nextNum {
+			nextNum = a.AttemptNumber + 1
+		}
+	}
+	plan, _, err := s.Config.ResolvePlan(sub.PlanID)
+	if err != nil {
+		return store.ChargeAttempt{}, err
+	}
+	token := ""
+	if s.Box != nil && len(sub.PaymentMethodCiphertext) > 0 && sub.PaymentMethodKeyVersion != nil {
+		plain, err := s.Box.Open(sub.PaymentMethodCiphertext, sub.PaymentMethodNonce, envelope.AAD("payment-method", sub.SubscriptionRef), *sub.PaymentMethodKeyVersion)
+		if err != nil {
+			return store.ChargeAttempt{}, err
+		}
+		token = string(plain)
+	}
+	ref, err := protocol.NewAttemptReference()
+	if err != nil {
+		return store.ChargeAttempt{}, err
+	}
+	idemp := "sb_charge_" + ref
+	shopper := ""
+	if sub.ProcessorShopperReference != nil {
+		shopper = *sub.ProcessorShopperReference
+	}
+	body := adyenadapter.CanonicalPaymentBody(plan.Adyen.MerchantAccount, plan.Currency, ref, shopper, token, plan.AmountMinor)
+	fp := sha256.Sum256(body)
+	aid, err := newID()
+	if err != nil {
+		return store.ChargeAttempt{}, err
+	}
+	var ct, nonce []byte
+	ver := envelope.VersionV1
+	if s.Box != nil {
+		ct, nonce, ver, err = s.Box.Seal(body, envelope.AAD("charge-request", aid))
+		if err != nil {
+			return store.ChargeAttempt{}, err
+		}
+	} else {
+		ct = body
+	}
+	endpoint := ""
+	if ad, ok := s.Adyen.(*adyenadapter.Adapter); ok {
+		endpoint = ad.PaymentsURL()
+	}
+	attempt := store.ChargeAttempt{
+		AttemptID:                aid,
+		ActionID:                 action.ActionID,
+		SubscriptionRef:          sub.SubscriptionRef,
+		PeriodStart:              sub.CurrentPeriodEnd,
+		PeriodEnd:                protocol.AddCalendarMonths(sub.CurrentPeriodEnd, 1),
+		AttemptNumber:            nextNum,
+		ProviderEndpoint:         endpoint,
+		ProviderAPIVersion:       adyenadapter.APIVersion,
+		MerchantAccount:          plan.Adyen.MerchantAccount,
+		AmountMinor:              plan.AmountMinor,
+		Currency:                 plan.Currency,
+		AttemptReference:         ref,
+		ShopperReference:         shopper,
+		ShopperInteraction:       "ContAuth",
+		RecurringProcessingModel: "Subscription",
+		IdempotencyKey:           idemp,
+		RequestFingerprint:       fp[:],
+		RequestCiphertext:        ct,
+		RequestNonce:             nonce,
+		RequestKeyVersion:        ver,
+		Status:                   "prepared",
+	}
+	if err := tx.InsertAttempt(attempt); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			attempts, err := tx.GetAttemptsForAction(action.ActionID)
+			if err != nil {
+				return store.ChargeAttempt{}, err
+			}
+			for _, a := range attempts {
+				if a.Status == "prepared" || a.Status == "uncertain" || a.Status == "running" {
+					return a, nil
+				}
+			}
+		}
+		return store.ChargeAttempt{}, err
+	}
+	return attempt, nil
+}
+
+// submit claims a prepared or uncertain attempt, calls Adyen, and records the outcome.
+func (s *Scheduler) submit(ctx context.Context, action store.ScheduledAction, attempt store.ChargeAttempt, replay bool) error {
+	now := s.now()
+	deadline := now.Add(s.Config.AdyenResolutionDeadline)
+	if s.Config.AdyenResolutionDeadline <= 0 {
+		deadline = now.Add(144 * time.Hour)
+	}
+	err := s.Store.InTx(ctx, func(tx store.Tx) error {
+		claimed, err := tx.ClaimAction(action.ActionID, now, s.lease())
+		if err != nil {
+			return err
+		}
+		action = claimed
+		if action.ClaimToken == nil {
+			return store.ErrNotOwned
+		}
+		action, attempt, err = tx.ClaimAttemptWithAction(action.ActionID, attempt.AttemptID, *action.ClaimToken, action.FencingToken, now, s.lease(), deadline)
 		return err
 	})
-	if errors.Is(err, store.ErrNotOwned) {
+	if errors.Is(err, store.ErrNotOwned) || errors.Is(err, store.ErrNotFound) || errors.Is(err, protocol.ErrAutomaticChargeBlocked) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
 	body := attempt.RequestCiphertext
-	if s.Box != nil {
-		body, err = s.Box.Open(attempt.RequestCiphertext, attempt.RequestNonce, envelope.AAD("charge-request", attempt.AttemptReference), attempt.RequestKeyVersion)
+	if s.Box != nil && len(attempt.RequestNonce) > 0 {
+		body, err = s.Box.Open(attempt.RequestCiphertext, attempt.RequestNonce, envelope.AAD("charge-request", attempt.AttemptID), attempt.RequestKeyVersion)
 		if err != nil {
 			return err
 		}
 	}
-	res, callErr := s.Adyen.ChargeRenewal(ctx, adapters.RenewalRequest{
-		Endpoint:         attempt.ProviderEndpoint,
-		APIVersion:       attempt.ProviderAPIVersion,
-		IdempotencyKey:   attempt.IdempotencyKey,
-		CanonicalBody:    body,
-		AttemptReference: attempt.AttemptReference,
-		MerchantAccount:  attempt.MerchantAccount,
-		AmountMinor:      attempt.AmountMinor,
-		Currency:         attempt.Currency,
-	})
+	var res adapters.RenewalResult
+	var callErr error
+	if replay {
+		resolved, err := s.Adyen.ResolveRenewalAttempt(ctx, adapters.RenewalAttempt{
+			Endpoint:       attempt.ProviderEndpoint,
+			APIVersion:     attempt.ProviderAPIVersion,
+			IdempotencyKey: attempt.IdempotencyKey,
+			CanonicalBody:  body,
+			AttemptRef:     attempt.AttemptReference,
+		})
+		callErr = err
+		res = adapters.RenewalResult{
+			Status:             resolved.Status,
+			ProcessorPaymentID: resolved.ProcessorPaymentID,
+			RefusalCode:        resolved.RefusalCode,
+			Uncertain:          resolved.Uncertain,
+		}
+	} else {
+		res, callErr = s.Adyen.ChargeRenewal(ctx, adapters.RenewalRequest{
+			Endpoint:         attempt.ProviderEndpoint,
+			APIVersion:       attempt.ProviderAPIVersion,
+			IdempotencyKey:   attempt.IdempotencyKey,
+			CanonicalBody:    body,
+			AttemptReference: attempt.AttemptReference,
+			MerchantAccount:  attempt.MerchantAccount,
+			AmountMinor:      attempt.AmountMinor,
+			Currency:         attempt.Currency,
+		})
+	}
+	claim := ""
+	if action.ClaimToken != nil {
+		claim = *action.ClaimToken
+	}
+	fence := action.FencingToken
 	return s.Store.InTx(ctx, func(tx store.Tx) error {
 		cur, err := tx.GetAttempt(attempt.AttemptID)
 		if err != nil {
@@ -252,6 +351,9 @@ func (s *Scheduler) charge(ctx context.Context, action store.ScheduledAction) er
 				return err
 			}
 			due := now.Add(time.Minute)
+			if cur.ResolutionDeadline != nil && due.After(*cur.ResolutionDeadline) {
+				due = *cur.ResolutionDeadline
+			}
 			cls := "uncertain"
 			return tx.FinishAction(action.ActionID, claim, fence, "uncertain", &due, &cls)
 		}
@@ -307,21 +409,34 @@ func (s *Scheduler) charge(ctx context.Context, action store.ScheduledAction) er
 		if err := s.Engine.Commit(tx, sub, dec); err != nil {
 			return err
 		}
-		due := now.Add(s.nextDelay(cur.AttemptNumber))
+		if !engine.IsRetryableRefusal(res.RefusalCode) || cur.AttemptNumber >= len(s.Config.RenewalRetryDelays) {
+			if err := tx.FinishAction(action.ActionID, claim, fence, "completed", nil, store.StrPtr("refused")); err != nil {
+				return err
+			}
+			delay := s.Config.DunningTermination
+			target := protocol.TruncateUTC(now.Add(delay))
+			key := protocol.ActionKey(sub.SubscriptionRef, protocol.ActionExpire, target)
+			aid, err := newID()
+			if err != nil {
+				return err
+			}
+			err = tx.InsertAction(store.ScheduledAction{
+				ActionID:        aid,
+				ActionKey:       key,
+				SubscriptionRef: sub.SubscriptionRef,
+				ActionType:      protocol.ActionExpire,
+				TargetAt:        target,
+				DueAt:           target,
+				Status:          "pending",
+			})
+			if errors.Is(err, store.ErrConflict) {
+				return nil
+			}
+			return err
+		}
+		due := now.Add(s.Config.RenewalRetryDelays[cur.AttemptNumber-1])
 		return tx.FinishAction(action.ActionID, claim, fence, "pending", &due, store.StrPtr("refused"))
 	})
-}
-
-// nextDelay returns the configured dunning delay for an attempt number.
-func (s *Scheduler) nextDelay(attemptNumber int) time.Duration {
-	idx := attemptNumber - 1
-	if idx >= 0 && idx < len(s.Config.RenewalRetryDelays) {
-		return s.Config.RenewalRetryDelays[idx]
-	}
-	if d := s.Config.DunningTermination; d > 0 {
-		return d
-	}
-	return 24 * time.Hour
 }
 
 // lease returns the scheduler claim lease duration.

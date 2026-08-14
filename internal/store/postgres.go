@@ -154,22 +154,27 @@ const subCols = `subscription_ref, checkout_id, plan_id, status, state_version, 
 func (t *pgTx) GetSubscription(ref string) (Subscription, error) {
 	return t.scanSub(`SELECT `+subCols+` FROM sb_subscriptions WHERE subscription_ref=$1`, ref)
 }
+
 // GetSubscriptionForUpdate loads a subscription with a row lock.
 func (t *pgTx) GetSubscriptionForUpdate(ref string) (Subscription, error) {
 	return t.scanSub(`SELECT `+subCols+` FROM sb_subscriptions WHERE subscription_ref=$1 FOR UPDATE`, ref)
 }
+
 // GetSubscriptionByCheckout finds the subscription bound to a checkout.
 func (t *pgTx) GetSubscriptionByCheckout(id string) (Subscription, error) {
 	return t.scanSub(`SELECT `+subCols+` FROM sb_subscriptions WHERE checkout_id=$1`, id)
 }
+
 // GetSubscriptionByProcessor looks up a subscription by processor IDs.
 func (t *pgTx) GetSubscriptionByProcessor(family, id string) (Subscription, error) {
 	return t.scanSub(`SELECT `+subCols+` FROM sb_subscriptions WHERE processor_family=$1 AND processor_subscription_id=$2`, family, id)
 }
+
 // GetSubscriptionByInitialPayment looks up a subscription by the initial payment ID.
 func (t *pgTx) GetSubscriptionByInitialPayment(family, id string) (Subscription, error) {
 	return t.scanSub(`SELECT `+subCols+` FROM sb_subscriptions WHERE processor_family=$1 AND processor_initial_payment_id=$2`, family, id)
 }
+
 // GetSubscriptionByChargePayment looks up a subscription by a later charge payment ID.
 func (t *pgTx) GetSubscriptionByChargePayment(id string) (Subscription, error) {
 	return t.scanSub(`SELECT `+subCols+` FROM sb_subscriptions s JOIN sb_charge_attempts a ON a.subscription_ref=s.subscription_ref WHERE a.processor_payment_id=$1`, id)
@@ -383,10 +388,12 @@ func (t *pgTx) InsertAction(a ScheduledAction) error {
 	return mapErr(err)
 }
 
-// GetActionByKey loads a scheduled action by its stable key.
-func (t *pgTx) GetActionByKey(key string) (ScheduledAction, error) {
+const actionCols = `action_id::text, action_key, subscription_ref, action_type, target_at, due_at, status, claim_token::text, fencing_token, lease_until, last_error_class`
+
+// scanAction scans a scheduled-action row.
+func (t *pgTx) scanAction(q string, args ...any) (ScheduledAction, error) {
 	var a ScheduledAction
-	err := t.tx.QueryRow(t.ctx, `SELECT action_id::text, action_key, subscription_ref, action_type, target_at, due_at, status, claim_token::text, fencing_token, lease_until, last_error_class FROM sb_scheduled_actions WHERE action_key=$1`, key).Scan(
+	err := t.tx.QueryRow(t.ctx, q, args...).Scan(
 		&a.ActionID, &a.ActionKey, &a.SubscriptionRef, &a.ActionType, &a.TargetAt, &a.DueAt, &a.Status, &a.ClaimToken, &a.FencingToken, &a.LeaseUntil, &a.LastErrorClass)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ScheduledAction{}, ErrNotFound
@@ -394,25 +401,57 @@ func (t *pgTx) GetActionByKey(key string) (ScheduledAction, error) {
 	return a, err
 }
 
-// ClaimDueAction leases one due scheduled action of the requested kinds.
-func (t *pgTx) ClaimDueAction(now time.Time, lease time.Duration, kinds ...string) (ScheduledAction, error) {
+// GetAction loads a scheduled action by ID.
+func (t *pgTx) GetAction(id string) (ScheduledAction, error) {
+	return t.scanAction(`SELECT `+actionCols+` FROM sb_scheduled_actions WHERE action_id=$1::uuid`, id)
+}
+
+// GetActionByKey loads a scheduled action by its stable key.
+func (t *pgTx) GetActionByKey(key string) (ScheduledAction, error) {
+	return t.scanAction(`SELECT `+actionCols+` FROM sb_scheduled_actions WHERE action_key=$1`, key)
+}
+
+// LockDueAction returns one due action of the requested status and kinds without claiming it.
+func (t *pgTx) LockDueAction(now time.Time, status string, kinds ...string) (ScheduledAction, error) {
 	kind := ""
 	if len(kinds) > 0 {
 		kind = kinds[0]
 	}
-	var a ScheduledAction
-	err := t.tx.QueryRow(t.ctx, `UPDATE sb_scheduled_actions SET status='running', claim_token=gen_random_uuid(), fencing_token=fencing_token+1, lease_until=$2, updated_at=NOW()
-		WHERE action_id=(
-			SELECT action_id FROM sb_scheduled_actions
-			WHERE status IN ('pending','uncertain') AND due_at <= $1 AND (lease_until IS NULL OR lease_until < $1)
-			AND ($3='' OR action_type=$3)
-			ORDER BY due_at FOR UPDATE SKIP LOCKED LIMIT 1
-		) RETURNING action_id::text, action_key, subscription_ref, action_type, target_at, due_at, status, claim_token::text, fencing_token, lease_until, last_error_class`, now, now.Add(lease), kind).Scan(
-		&a.ActionID, &a.ActionKey, &a.SubscriptionRef, &a.ActionType, &a.TargetAt, &a.DueAt, &a.Status, &a.ClaimToken, &a.FencingToken, &a.LeaseUntil, &a.LastErrorClass)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ScheduledAction{}, ErrNotFound
+	return t.scanAction(`SELECT `+actionCols+` FROM sb_scheduled_actions
+		WHERE due_at <= $1
+		AND ($3='' OR action_type=$3)
+		AND (
+			status=$2
+			OR (status='running' AND $2 IN ('pending','uncertain') AND (lease_until IS NULL OR lease_until < $1))
+		)
+		AND (lease_until IS NULL OR lease_until < $1 OR status='running')
+		AND (action_type <> 'renew' OR EXISTS (
+			SELECT 1 FROM sb_subscriptions s WHERE s.subscription_ref = sb_scheduled_actions.subscription_ref AND NOT s.automatic_charging_blocked
+		))
+		ORDER BY due_at FOR UPDATE SKIP LOCKED LIMIT 1`, now, status, kind)
+}
+
+// ClaimAction takes or reclaims ownership of a specific action and increments its fence.
+func (t *pgTx) ClaimAction(actionID string, now time.Time, lease time.Duration) (ScheduledAction, error) {
+	return t.scanAction(`UPDATE sb_scheduled_actions SET status='running', claim_token=gen_random_uuid(), fencing_token=fencing_token+1, lease_until=$2, updated_at=NOW()
+		WHERE action_id=$1::uuid
+		AND (
+			status IN ('pending','uncertain')
+			OR (status='running' AND (lease_until IS NULL OR lease_until < $3))
+		)
+		AND (action_type <> 'renew' OR EXISTS (
+			SELECT 1 FROM sb_subscriptions s WHERE s.subscription_ref = sb_scheduled_actions.subscription_ref AND NOT s.automatic_charging_blocked
+		))
+		RETURNING `+actionCols, actionID, now.Add(lease), now)
+}
+
+// ClaimDueAction locks and claims one due scheduled action of the requested status and kinds.
+func (t *pgTx) ClaimDueAction(now time.Time, lease time.Duration, status string, kinds ...string) (ScheduledAction, error) {
+	a, err := t.LockDueAction(now, status, kinds...)
+	if err != nil {
+		return ScheduledAction{}, err
 	}
-	return a, err
+	return t.ClaimAction(a.ActionID, now, lease)
 }
 
 // FinishAction completes or reschedules a claimed action if the fence still matches.
@@ -422,10 +461,35 @@ func (t *pgTx) FinishAction(actionID, claimToken string, fence int64, status str
 	return owned(tag.RowsAffected(), err)
 }
 
+// ForceFinishAction completes a non-terminal action without a fencing match, for webhook correlation.
+func (t *pgTx) ForceFinishAction(actionID, status string, dueAt *time.Time, errClass *string) error {
+	_, err := t.tx.Exec(t.ctx, `UPDATE sb_scheduled_actions SET status=$2, due_at=COALESCE($3, due_at), last_error_class=$4, claim_token=NULL, lease_until=NULL, updated_at=NOW()
+		WHERE action_id=$1::uuid AND status IN ('pending','running','uncertain')`, actionID, status, dueAt, errClass)
+	return err
+}
+
 // CancelActionsForSubscription cancels pending actions except an optional keep-key.
 func (t *pgTx) CancelActionsForSubscription(ref, exceptKey string) error {
-	_, err := t.tx.Exec(t.ctx, `UPDATE sb_scheduled_actions SET status='canceled', claim_token=NULL, lease_until=NULL, updated_at=NOW() WHERE subscription_ref=$1 AND action_key <> $2 AND status IN ('pending','running')`, ref, exceptKey)
+	_, err := t.tx.Exec(t.ctx, `UPDATE sb_scheduled_actions SET status='canceled', claim_token=NULL, lease_until=NULL, updated_at=NOW() WHERE subscription_ref=$1 AND action_key <> $2 AND status IN ('pending','uncertain')`, ref, exceptKey)
 	return err
+}
+
+// ListActions returns scheduled actions for operator status.
+func (t *pgTx) ListActions(limit int) ([]ScheduledAction, error) {
+	rows, err := t.tx.Query(t.ctx, `SELECT `+actionCols+` FROM sb_scheduled_actions ORDER BY due_at LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ScheduledAction
+	for rows.Next() {
+		var a ScheduledAction
+		if err := rows.Scan(&a.ActionID, &a.ActionKey, &a.SubscriptionRef, &a.ActionType, &a.TargetAt, &a.DueAt, &a.Status, &a.ClaimToken, &a.FencingToken, &a.LeaseUntil, &a.LastErrorClass); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // InsertAttempt records a charge attempt with its encrypted canonical request.
@@ -445,6 +509,17 @@ func (t *pgTx) InsertAttempt(a ChargeAttempt) error {
 func (t *pgTx) GetAttempt(id string) (ChargeAttempt, error) {
 	var a ChargeAttempt
 	err := t.tx.QueryRow(t.ctx, `SELECT attempt_id::text, action_id::text, subscription_ref, period_start, period_end, attempt_number, provider_endpoint, provider_api_version, merchant_account, amount_minor, currency, attempt_reference, shopper_reference, shopper_interaction, recurring_processing_model, idempotency_key, request_fingerprint, request_ciphertext, request_nonce, request_key_version, processor_payment_id, status, claim_token::text, fencing_token, lease_until, first_submitted_at, resolution_deadline, refusal_reason_code, completed_at FROM sb_charge_attempts WHERE attempt_id=$1::uuid`, id).Scan(
+		&a.AttemptID, &a.ActionID, &a.SubscriptionRef, &a.PeriodStart, &a.PeriodEnd, &a.AttemptNumber, &a.ProviderEndpoint, &a.ProviderAPIVersion, &a.MerchantAccount, &a.AmountMinor, &a.Currency, &a.AttemptReference, &a.ShopperReference, &a.ShopperInteraction, &a.RecurringProcessingModel, &a.IdempotencyKey, &a.RequestFingerprint, &a.RequestCiphertext, &a.RequestNonce, &a.RequestKeyVersion, &a.ProcessorPaymentID, &a.Status, &a.ClaimToken, &a.FencingToken, &a.LeaseUntil, &a.FirstSubmittedAt, &a.ResolutionDeadline, &a.RefusalReasonCode, &a.CompletedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ChargeAttempt{}, ErrNotFound
+	}
+	return a, err
+}
+
+// GetAttemptByReference loads a charge attempt by its stable Adyen reference.
+func (t *pgTx) GetAttemptByReference(ref string) (ChargeAttempt, error) {
+	var a ChargeAttempt
+	err := t.tx.QueryRow(t.ctx, `SELECT attempt_id::text, action_id::text, subscription_ref, period_start, period_end, attempt_number, provider_endpoint, provider_api_version, merchant_account, amount_minor, currency, attempt_reference, shopper_reference, shopper_interaction, recurring_processing_model, idempotency_key, request_fingerprint, request_ciphertext, request_nonce, request_key_version, processor_payment_id, status, claim_token::text, fencing_token, lease_until, first_submitted_at, resolution_deadline, refusal_reason_code, completed_at FROM sb_charge_attempts WHERE attempt_reference=$1`, ref).Scan(
 		&a.AttemptID, &a.ActionID, &a.SubscriptionRef, &a.PeriodStart, &a.PeriodEnd, &a.AttemptNumber, &a.ProviderEndpoint, &a.ProviderAPIVersion, &a.MerchantAccount, &a.AmountMinor, &a.Currency, &a.AttemptReference, &a.ShopperReference, &a.ShopperInteraction, &a.RecurringProcessingModel, &a.IdempotencyKey, &a.RequestFingerprint, &a.RequestCiphertext, &a.RequestNonce, &a.RequestKeyVersion, &a.ProcessorPaymentID, &a.Status, &a.ClaimToken, &a.FencingToken, &a.LeaseUntil, &a.FirstSubmittedAt, &a.ResolutionDeadline, &a.RefusalReasonCode, &a.CompletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ChargeAttempt{}, ErrNotFound
@@ -474,6 +549,31 @@ func (t *pgTx) GetAttemptsForAction(actionID string) ([]ChargeAttempt, error) {
 	return out, rows.Err()
 }
 
+// ListAttempts returns charge attempts matching the given statuses.
+func (t *pgTx) ListAttempts(statuses []string, limit int) ([]ChargeAttempt, error) {
+	if len(statuses) == 0 {
+		statuses = []string{"uncertain", "manual_review", "running", "prepared"}
+	}
+	rows, err := t.tx.Query(t.ctx, `SELECT attempt_id::text FROM sb_charge_attempts WHERE status = ANY($1) ORDER BY created_at DESC LIMIT $2`, statuses, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChargeAttempt
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		a, err := t.GetAttempt(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // UpdateAttempt writes charge-attempt status and provider correlation.
 func (t *pgTx) UpdateAttempt(a ChargeAttempt) error {
 	_, err := t.tx.Exec(t.ctx, `UPDATE sb_charge_attempts SET status=$2, processor_payment_id=$3, claim_token=$4::uuid, fencing_token=$5, lease_until=$6, first_submitted_at=$7, resolution_deadline=$8, refusal_reason_code=$9, completed_at=$10 WHERE attempt_id=$1::uuid`,
@@ -482,9 +582,13 @@ func (t *pgTx) UpdateAttempt(a ChargeAttempt) error {
 }
 
 // ClaimAttemptWithAction re-validates action ownership before mutating an attempt.
-func (t *pgTx) ClaimAttemptWithAction(actionID, attemptID, claimToken string, fence int64, now time.Time, lease time.Duration) (ScheduledAction, ChargeAttempt, error) {
+func (t *pgTx) ClaimAttemptWithAction(actionID, attemptID, claimToken string, fence int64, now time.Time, lease time.Duration, resolutionDeadline time.Time) (ScheduledAction, ChargeAttempt, error) {
 	until := now.Add(lease)
-	tag, err := t.tx.Exec(t.ctx, `UPDATE sb_scheduled_actions SET status='running', claim_token=$2::uuid, fencing_token=$3, lease_until=$4, updated_at=NOW() WHERE action_id=$1::uuid`, actionID, claimToken, fence, until)
+	if resolutionDeadline.IsZero() {
+		resolutionDeadline = now.Add(6 * 24 * time.Hour)
+	}
+	tag, err := t.tx.Exec(t.ctx, `UPDATE sb_scheduled_actions SET lease_until=$4, updated_at=NOW()
+		WHERE action_id=$1::uuid AND status='running' AND claim_token=$2::uuid AND fencing_token=$3`, actionID, claimToken, fence, until)
 	if err != nil {
 		return ScheduledAction{}, ChargeAttempt{}, err
 	}
@@ -492,21 +596,51 @@ func (t *pgTx) ClaimAttemptWithAction(actionID, attemptID, claimToken string, fe
 		return ScheduledAction{}, ChargeAttempt{}, ErrNotOwned
 	}
 	_, err = t.tx.Exec(t.ctx, `UPDATE sb_charge_attempts SET status='running', claim_token=$2::uuid, fencing_token=$3, lease_until=$4,
-		first_submitted_at=COALESCE(first_submitted_at, date_trunc('second',$5)), resolution_deadline=COALESCE(resolution_deadline, date_trunc('second',$5)+interval '6 days')
-		WHERE attempt_id=$1::uuid`, attemptID, claimToken, fence, until, now)
+		first_submitted_at=COALESCE(first_submitted_at, date_trunc('second',$5)), resolution_deadline=COALESCE(resolution_deadline, date_trunc('second',$6))
+		WHERE attempt_id=$1::uuid`, attemptID, claimToken, fence, until, now, resolutionDeadline)
 	if err != nil {
 		return ScheduledAction{}, ChargeAttempt{}, err
 	}
-	a, err := t.GetActionByKey("") // replaced below
-	_ = a
-	var act ScheduledAction
-	err = t.tx.QueryRow(t.ctx, `SELECT action_id::text, action_key, subscription_ref, action_type, target_at, due_at, status, claim_token::text, fencing_token, lease_until, last_error_class FROM sb_scheduled_actions WHERE action_id=$1::uuid`, actionID).Scan(
-		&act.ActionID, &act.ActionKey, &act.SubscriptionRef, &act.ActionType, &act.TargetAt, &act.DueAt, &act.Status, &act.ClaimToken, &act.FencingToken, &act.LeaseUntil, &act.LastErrorClass)
+	act, err := t.GetAction(actionID)
 	if err != nil {
 		return ScheduledAction{}, ChargeAttempt{}, err
 	}
 	att, err := t.GetAttempt(attemptID)
 	return act, att, err
+}
+
+// ListSubscriptions returns subscriptions for operator reconcile.
+func (t *pgTx) ListSubscriptions(limit int) ([]Subscription, error) {
+	rows, err := t.tx.Query(t.ctx, `SELECT subscription_ref FROM sb_subscriptions ORDER BY updated_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]Subscription, 0, len(ids))
+	for _, id := range ids {
+		s, err := t.GetSubscription(id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// LatestOutbound returns the highest state_version outbound event for a subscription.
+func (t *pgTx) LatestOutbound(subscriptionRef string) (OutboundEvent, error) {
+	return t.scanOutbound(`SELECT event_id, event_type, subscription_ref, checkout_id, state_version, payload_body, delivery_state, attempt_count, next_attempt_at, delivered_at, dead_lettered_at, abandoned_at, last_error_class, claim_token::text, fencing_token, lease_until, created_at FROM sb_outbound_events WHERE subscription_ref=$1 ORDER BY state_version DESC LIMIT 1`, subscriptionRef)
 }
 
 // InsertAudit appends an operator audit row.
