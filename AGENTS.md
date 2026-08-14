@@ -234,6 +234,16 @@ When implementing, updating, or reviewing a function, ask:
 
 Flag questionable behavior rather than silently preserving it.
 
+## Function Comments
+
+Every new or substantially rewritten function must have a short comment immediately above it that states what it is for. A phrase or one sentence is enough. Do not narrate the implementation.
+
+- Exported functions use a complete godoc sentence that starts with the function name.
+- Unexported functions may use a concise phrase.
+- If the function is a stub, incomplete, unproven, or unusually non-standard, the comment must include `QA / TODO:` plus a brief reason.
+- Do not leave uncommented helpers, constructors, HTTP handlers, CLI commands, or test functions.
+- Do not write comments that only restate the identifier (`// GetCheckout gets a checkout`).
+
 ## Key Configurations and Constants
 
 Protocol constants, HKDF labels, replay windows, callback limits, retry schedules, status mappings, and plan mappings must have one authoritative source.

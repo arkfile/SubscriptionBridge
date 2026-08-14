@@ -1,0 +1,11 @@
+/bin/
+/bridge
+/bridge-cli
+/mock-bridge
+*.exe
+*.test
+.env
+.env.*
+coverage.out
+coverage.html
+vendor/

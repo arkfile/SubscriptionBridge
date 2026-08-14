@@ -1,0 +1,23 @@
+default_processor: stripe
+
+plans:
+  plan_500gb:
+    processor: stripe
+    currency: USD
+    amount_minor: 500
+    interval: month
+    stripe:
+      price_id: price_replace_me
+    adyen:
+      merchant_account: ExampleMerchant
+      country_code: CH
+  plan_1tb:
+    processor: adyen
+    currency: EUR
+    amount_minor: 900
+    interval: month
+    stripe:
+      price_id: price_replace_me_1tb
+    adyen:
+      merchant_account: ExampleMerchantEU
+      country_code: DE

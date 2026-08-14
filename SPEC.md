@@ -1071,7 +1071,7 @@ subscription-bridge/
 
 ## 20. Status
 
-**Greenfield — specification repository created; provider implementation has not begun.** Arkfile's consumer implements current protocol v1 and passes the canonical fixture tests. Finalize and test the bridge migrations, protocol package, schemas, interfaces, state machines, and crash-recovery behavior before implementing either provider. Stripe and Adyen are both required v1 adapters and must pass the common conformance suite before release.
+**Greenfield — protocol, store, engine, notifier, scheduler, HTTP API, Stripe and Adyen adapters, operator CLI, and deploy artifacts are in this repository.** Arkfile's consumer implements current protocol v1 and passes the canonical fixture tests. Complete both provider conformance suites against live test platforms, PostgreSQL integration tests, and operator runbooks before a production release.
 
 ---
 

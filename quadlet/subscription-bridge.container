@@ -1,0 +1,17 @@
+[Unit]
+Description=Subscription Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/subscription-bridge:latest
+ContainerName=subscription-bridge
+UserNS=keep-id
+PublishPort=127.0.0.1:8081:8081
+EnvironmentFile=/etc/subscription-bridge/bridge.env
+Volume=/etc/subscription-bridge/plans.yaml:/config/plans.yaml:ro
+HealthCmd=/bridge-cli health
+HealthInterval=30s
+
+[Install]
+WantedBy=default.target

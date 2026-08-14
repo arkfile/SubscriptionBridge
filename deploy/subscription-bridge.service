@@ -1,0 +1,24 @@
+[Unit]
+Description=Subscription Bridge
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bridge
+Group=bridge
+WorkingDirectory=/var/lib/subscription-bridge
+EnvironmentFile=/etc/subscription-bridge/bridge.env
+ExecStart=/usr/local/bin/bridge
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

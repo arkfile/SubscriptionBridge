@@ -6,7 +6,7 @@ The bridge and its processors must never receive consumer usernames or other con
 
 ## Project Status
 
-Subscription Bridge is a greenfield project under active development. There are no production deployments and no backward-compatibility requirements unless explicitly documented.
+Subscription Bridge is a greenfield project under active implementation. There are no production deployments and no backward-compatibility requirements unless explicitly documented.
 The normative implementation contract is `SPEC.md`. Where this README and `SPEC.md` differ, `SPEC.md` takes precedence.
 Arkfile's consumer implementation supports current protocol v1 and passes the canonical cross-repository fixture tests.
 
