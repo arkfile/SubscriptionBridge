@@ -304,6 +304,10 @@ Metrics should use low-cardinality labels. Never use `checkout_id`, `subscriptio
 
 Health endpoints must not disclose configuration or credentials.
 
+## Deployment
+
+VPS install and update use `scripts/deploy.sh`. Do not invent an alternate installer, assume a product hostname, or hard-code a consumer webhook path. The public domain and full consumer callback URL are operator inputs. The script installs Debian or RHEL-family packages and pinned Go, then builds Caddy with xcaddy and `caddy-dns/desec` using the versions pinned at the top of `scripts/deploy.sh`. TLS is Caddy with Let's Encrypt DNS-01 via deSEC; the bridge binds loopback HTTP. Production startup still does not apply migrations. Suggested subdomains are things like `billing.`, `pay.`, `subscriptions.`, but the choice is up to the operator.
+
 ## TypeScript assets
 
 Compile hosted TypeScript with a Zig-based Bun (`1.2.x` or `1.3.x`, last Zig release `1.3.14`):

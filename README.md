@@ -120,3 +120,25 @@ Consumer -> authenticated GET -> /v1/subscriptions/{subscription_ref}
 Stripe -> authenticated webhook -> /v1/webhooks/stripe -> Stripe adapter
 Adyen  -> authenticated webhook -> /v1/webhooks/adyen  -> Adyen adapter
 ```
+
+## Deployment
+
+Each v1 deployment serves one consumer application. The public hostname and consumer callback URL are operator-supplied; the repository does not assume a product domain.
+
+On a dedicated VPS with Debian/Ubuntu or RHEL-family Linux and managed PostgreSQL in the same region:
+
+```bash
+sudo bash scripts/deploy.sh install \
+  --domain billing.example.com \
+  --consumer-url https://app.example.com/api/webhooks/subscription-bridge \
+  --acme-email ops@example.com \
+  --migrate
+```
+
+The script installs host packages (`curl`, `git`, `openssl`, `ufw` or `firewalld`, and related tools) and pinned Go 1.26.6 from go.dev when the compiler is missing or too old. Distro `golang` packages are not used. It then builds Caddy v2.11.4 with xcaddy v0.4.6 and `github.com/caddy-dns/desec@v1.1.0` (the same pins as Arkfile’s VPS path), verifies the `dns.providers.desec` module, and installs the binary to `/usr/local/bin/caddy`.
+
+`update` rebuilds `bridge` and `bridge-cli`, refreshes systemd units and the Caddyfile, and restarts services without rewriting `bridge.env` or `plans.yaml`. Pass `--rebuild-caddy` only when the pinned Caddy/deSEC binary must be replaced.
+
+The deSEC token and database URL are prompted. `scripts/deploy.sh` generates a pairing root on first install if you do not paste an existing one; configure that same 64-character lowercase hex value on the consumer. Production startup does not apply migrations; `bridge-cli migrate` (or `--migrate`) does. If `plans.yaml` still has placeholder SKUs or processor credentials are incomplete, Caddy still serves TLS and the bridge unit is left stopped until `bridge-cli check-config` succeeds.
+
+See `SPEC.md` section 13, `deploy/Caddyfile.prod`, and `deploy/bridge.env.example`.

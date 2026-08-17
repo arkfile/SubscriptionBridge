@@ -24,6 +24,12 @@ func main() {
 	}
 	ctx := context.Background()
 	switch os.Args[1] {
+	case "check-config":
+		if err := checkConfig(); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+		fmt.Println("ok")
 	case "migrate":
 		pool := mustPool(ctx)
 		defer pool.Close()
@@ -164,7 +170,16 @@ func main() {
 
 // usage prints supported CLI commands.
 func usage() {
-	fmt.Fprintln(os.Stderr, `bridge-cli migrate|health|show-checkout|show-subscription|list-events|requeue-event|abandon-event|scheduler-status|reconcile|resolve-attempt`)
+	fmt.Fprintln(os.Stderr, `bridge-cli check-config|migrate|health|show-checkout|show-subscription|list-events|requeue-event|abandon-event|scheduler-status|reconcile|resolve-attempt`)
+}
+
+// checkConfig loads and validates environment plus the plan catalog.
+func checkConfig() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	return cfg.LoadCatalog()
 }
 
 // mustPool opens a PostgreSQL pool from BRIDGE_DATABASE_URL.

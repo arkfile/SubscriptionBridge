@@ -934,8 +934,9 @@ Startup must fail fast if the pairing root is not exactly 64 lowercase hexadecim
 - Small app VPS (1–2 vCPU, 1–2 GB RAM) + managed Postgres in same region.
 - TLS reverse proxy (Caddy) → bridge on loopback.
 - Dedicated unprivileged runtime user; rootless container or static binary under systemd.
-- Stripe dashboard: register `https://billing.example.com/v1/webhooks/stripe` for subscription events.
-- Adyen Customer Area: configure the Standard webhook at `https://billing.example.com/v1/webhooks/adyen`, enable HMAC, and restrict API credentials to required Checkout/recurring operations.
+- First-time VPS install and later binary updates: `scripts/deploy.sh install|update`. The public hostname and full consumer callback URL are required flags or prompts; there is no product-specific default domain. The script installs Debian or RHEL-family host packages and pinned Go from go.dev, then builds Caddy with xcaddy and the deSEC DNS module using the same version pins as the Arkfile VPS path. TLS is Let's Encrypt DNS-01 via deSEC. The script must not assume a consumer path, consumer environment variable names, or a particular organization hostname.
+- Stripe dashboard: register `https://<bridge-host>/v1/webhooks/stripe` for subscription events.
+- Adyen Customer Area: configure the Standard webhook at `https://<bridge-host>/v1/webhooks/adyen`, enable HMAC, and restrict API credentials to required Checkout/recurring operations. Allow the bridge origin on the Adyen client key.
 - If containers are used, ship a `Containerfile` and rootless Podman/Quadlet definitions. Native systemd deployment remains supported.
 
 ---
@@ -944,6 +945,7 @@ Startup must fail fast if the pairing root is not exactly 64 lowercase hexadecim
 
 | Command | Purpose |
 |---|---|
+| `bridge check-config` | Validate environment and plan catalog without opening processor connections |
 | `bridge health` | Liveness + DB connectivity |
 | `bridge show-checkout <checkout_id>` | Local checkout + subscription mapping |
 | `bridge show-subscription <subscription_ref>` | Status + processor IDs (operator only) |
@@ -1032,6 +1034,13 @@ subscription-bridge/
 ├── migrations/
 ├── config/
 │   └── plans.example.yaml
+├── scripts/
+│   └── deploy.sh              # VPS install/update (Caddy + deSEC + systemd)
+├── deploy/
+│   ├── Caddyfile.prod
+│   ├── caddy.service
+│   ├── subscription-bridge.service
+│   └── bridge.env.example
 ├── Containerfile
 ├── quadlet/
 │   └── subscription-bridge.container

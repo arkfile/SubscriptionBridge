@@ -1,3 +1,6 @@
+# Local/dev stub only. Production TLS uses deploy/Caddyfile.prod via scripts/deploy.sh.
+# DNS-01 (deSEC) is required for public deployments; do not copy this file to /etc/caddy.
+
 billing.example.com {
 	reverse_proxy 127.0.0.1:8081
 }

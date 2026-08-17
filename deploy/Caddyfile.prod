@@ -1,0 +1,23 @@
+# Rendered by scripts/deploy.sh into /etc/caddy/Caddyfile.
+# {GLOBAL_BLOCK} and {DOMAIN} are replaced at install time.
+# TLS is DNS-01 via deSEC. The bridge listens on loopback HTTP.
+
+{GLOBAL_BLOCK}
+
+{DOMAIN} {
+	tls {
+		dns desec {
+			token "{$DESEC_TOKEN}"
+		}
+		protocols tls1.3
+		key_type p384
+	}
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+	}
+
+	reverse_proxy 127.0.0.1:8081
+
+	encode gzip
+}

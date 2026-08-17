@@ -1,6 +1,6 @@
 [Unit]
 Description=Subscription Bridge
-After=network-online.target postgresql.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -16,8 +16,12 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
 CapabilityBoundingSet=
 AmbientCapabilities=
+ReadWritePaths=/var/lib/subscription-bridge
 MemoryMax=512M
 
 [Install]
