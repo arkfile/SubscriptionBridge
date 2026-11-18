@@ -710,7 +710,7 @@ write_bridge_env_if_missing() {
         printf 'BRIDGE_PUBLIC_URL=https://%s\n' "$DOMAIN"
         printf 'CONSUMER_WEBHOOK_URL=%s\n' "$CONSUMER_URL"
         printf 'BRIDGE_CONSUMER_PAIRING_ROOT=%s\n' "$pairing_root"
-        printf 'BRIDGE_LISTEN=127.0.0.1:8081\n'
+        printf 'BRIDGE_LISTEN=127.0.0.1:8787\n'
         printf 'BRIDGE_PLANS_PATH=%s\n' "$BRIDGE_PLANS"
         printf 'BRIDGE_DATABASE_URL=%s\n' "$database_url"
         printf 'BRIDGE_DEFAULT_PROCESSOR=stripe\n'

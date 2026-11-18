@@ -83,7 +83,7 @@ func Load() (Config, error) {
 		AdyenLivePrefix:        strings.TrimSpace(os.Getenv("ADYEN_LIVE_PREFIX")),
 		AdyenEnvironment:       getenv("ADYEN_ENVIRONMENT", "test"),
 		AdyenDataEncryptionKey: strings.TrimSpace(os.Getenv("ADYEN_DATA_ENCRYPTION_KEY")),
-		Listen:                 getenv("BRIDGE_LISTEN", "127.0.0.1:8081"),
+		Listen:                 getenv("BRIDGE_LISTEN", "127.0.0.1:8787"),
 		DatabaseURL:            strings.TrimSpace(os.Getenv("BRIDGE_DATABASE_URL")),
 		LogLevel:               getenv("BRIDGE_LOG_LEVEL", "info"),
 		SchedulerEnabled:       getenv("BRIDGE_SCHEDULER_ENABLED", "true") != "false",

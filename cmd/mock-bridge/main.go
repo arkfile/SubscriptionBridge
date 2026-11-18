@@ -30,7 +30,7 @@ func main() {
 	}
 	mem := store.NewMemory(nil)
 	cfg := config.Config{
-		PublicURL:          "http://127.0.0.1:8081",
+		PublicURL:          "http://127.0.0.1:8787",
 		ConsumerWebhookURL: getenv("CONSUMER_WEBHOOK_URL", "http://127.0.0.1:9/webhook"),
 		PairingRoot:        root,
 		DefaultProcessor:   protocol.ProcessorStripe,
@@ -56,7 +56,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go n.Loop(ctx, time.Second)
-	addr := getenv("BRIDGE_LISTEN", "127.0.0.1:8081")
+	addr := getenv("BRIDGE_LISTEN", "127.0.0.1:8787")
 	srv := &http.Server{Addr: addr, Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	if err := srv.ListenAndServe(); err != nil {
 		os.Exit(1)
