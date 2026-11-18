@@ -26,13 +26,14 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Pinned toolchains. Go matches go.mod / CI. Caddy+deSEC match the Arkfile VPS pins.
+# Pinned toolchains. Go matches go.mod / CI. xcaddy and deSEC match the Arkfile VPS pins.
+# Caddy is the current 2.11 security release.
 # github.com/caddy-dns/desec tags start at v1.0.0 (v0.2.x is libdns/desec, not this module).
-GO_VERSION="${GO_VERSION:-1.26.6}"
-GO_SHA256_LINUX_AMD64="708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89"
-GO_SHA256_LINUX_ARM64="d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e"
+GO_VERSION="${GO_VERSION:-1.26.11}"
+GO_SHA256_LINUX_AMD64="9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec"
+GO_SHA256_LINUX_ARM64="6c2f29b458b5add0835f18b776f69c8881a6d88428f1484a6da55755e620757e"
 XCADDY_VERSION="${XCADDY_VERSION:-v0.4.6}"
-CADDY_VERSION="${CADDY_VERSION:-v2.11.4}"
+CADDY_VERSION="${CADDY_VERSION:-v2.11.9}"
 CADDY_DESEC_MODULE="${CADDY_DESEC_MODULE:-github.com/caddy-dns/desec@v1.1.0}"
 OS_FAMILY=""
 

@@ -135,7 +135,7 @@ sudo bash scripts/deploy.sh install \
   --migrate
 ```
 
-The script installs host packages (`curl`, `git`, `openssl`, `ufw` or `firewalld`, and related tools) and pinned Go 1.26.6 from go.dev when the compiler is missing or too old. Distro `golang` packages are not used. It then builds Caddy v2.11.4 with xcaddy v0.4.6 and `github.com/caddy-dns/desec@v1.1.0` (the same pins as Arkfile’s VPS path), verifies the `dns.providers.desec` module, and installs the binary to `/usr/local/bin/caddy`.
+The script installs host packages (`curl`, `git`, `openssl`, `ufw` or `firewalld`, and related tools) and pinned Go 1.26.11 from go.dev when the compiler is missing or too old. Distro `golang` packages are not used. It then builds Caddy v2.11.9 with xcaddy v0.4.6 and `github.com/caddy-dns/desec@v1.1.0`, verifies the `dns.providers.desec` module, and installs the binary to `/usr/local/bin/caddy`. xcaddy and deSEC match Arkfile's VPS pins. Caddy is the current 2.11 security release.
 
 `update` rebuilds `bridge` and `bridge-cli`, refreshes systemd units and the Caddyfile, and restarts services without rewriting `bridge.env` or `plans.yaml`. Pass `--rebuild-caddy` only when the pinned Caddy/deSEC binary must be replaced.
 
